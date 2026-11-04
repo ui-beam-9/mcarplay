@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      UPSTREAM_REPO: ${{ inputs.upstream || 'MengMengCode/VoCat' }}
+      UPSTREAM_REPO: ${{ inputs.upstream || 'wangxso/mcarplay' }}
       TARGET_BRANCH: ${{ inputs.branch || 'main' }}
       FORCE_SYNC: ${{ inputs.force || 'false' }}
       SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
