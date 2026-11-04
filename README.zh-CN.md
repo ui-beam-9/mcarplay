@@ -22,9 +22,11 @@ CarWith。车机显示的是 CarWith 界面。
 
 ## 当前进度
 
-项目处于实验阶段，截至 2026 年 10 月 31 日已跑通小米到 DiPlay、小米到 WinPlay 1.2.5
-的测试链路，并验证一条小米到奇瑞车机的手动无线连接路径。
-当前正式版为 `v0.1.3`，发布范围仍是已验收的手动连接路径。
+项目处于实验阶段。截至 2026 年 11 月 4 日，已在 ARM64 AVD 上完成 HyperOS OS1–OS4
+的 CarWith 源端出流测试；截至 2026 年 10 月 31 日，也已跑通小米到 DiPlay、小米到
+WinPlay 1.2.5 的测试链路，并验证一条小米到奇瑞车机的手动无线连接路径。
+当前正式版为 `v0.1.4`，新增大众帕萨特 2025、奇瑞艾瑞泽 8 与蓝牙自动连接相关改动，
+尚未在对应车上复测；已验证的实车范围仍是奇瑞手动连接路径。
 
 | 能力 | 验证结果 |
 | --- | --- |
@@ -46,6 +48,36 @@ Android 17，CarWith `4.0.20-20260923`，小米 CarLife `8.8.5`（早期 DiPlay 
 应用最低 SDK 为 Android 12 / API 31，这不代表所有 Android 12 及以上设备均兼容。
 上游 CarDeck 的实车测试不能直接作为 mcarplay CarWith 桥接的车型适配结论。
 
+### CarWith 兼容矩阵
+
+2026 年 11 月 4 日，使用小米 CarLife `8.6.8/260`，在 HyperOS OS1–OS4 上测试了公开取得的
+CarWith 构建。“持续出流”要求七路 CarLife 通道全部连通，完成 RSA/AES、手机渠道准入和
+`VIDEO_INIT_DONE 1280x720@30`，并至少持续 20 秒收到非零 H.264 视频。
+
+| 手机 / HyperOS | Android | 测试 CarWith 构建数 | 持续出流 |
+| --- | ---: | ---: | ---: |
+| `OS1.0.4.0.TGACNXM`<br>小米 10S / thyme 系统分区 | 13 | 50 | 37 |
+| `OS2.0.215.0.VMCCNXM`<br>小米 13 / fuxi 系统分区 | 15 | 50 | 38 |
+| `OS3.0.2.0.WMCCNXM`<br>HyperOS AVD | 16 | 50 | 39 |
+| `OS4.0.24.0.XFRCNXM`<br>HyperOS AVD | 17 | 5，从系统初始版 `4.0.16-20260907` 开始 | 4 |
+
+关键边界：
+
+- `2.0.0-20231103` 至 `2.3.0-20240606` 共 11 个构建在 OS1–OS3 均未收到视频帧；
+  `2.3.1-20240712` 是首个能够持续出流的构建。
+- `3.8.2-20260117` 仅在 OS1 上发生 CarWith 自身崩溃；`3.8.3-20260203` 已修复。
+- `4.0.20-20261009` 在 APK 内限制为 Android SDK 36，会在 OS1、OS2 和 OS4 主动退出；
+  mcarplay 无法绕过该构建自身的平台门禁。
+- OS4 测试集为 `4.0.16-20260907`、`4.0.20-20260929`、`4.0.20-20261009`、
+  `4.0.21-20260929` 和 `4.0.23-20261016`，其中 4 个成功持续出流。
+
+<a href="docs/screenshots/carwith-hyperos-carlife-matrix-2026-11-04.png"><img src="docs/screenshots/carwith-hyperos-carlife-matrix-2026-11-04.png" width="960" alt="CarWith 2.x 至 4.x 在 HyperOS OS1 至 OS4 上配合小米 CarLife 8.6.8/260 的持续出流矩阵"></a>
+
+以上是 AVD 上的源端出流证据，不构成完整实体设备兼容结论。OS1–OS3 使用小米系统分区与
+ranchu vendor/kernel 混合镜像，并运行在 permissive 模式；OS4 为 enforcing，但硬件底座仍是
+模拟器。没有当前公开入口的旧版构建使用了 root 辅助的内部服务探针。本矩阵不能证明实体
+Qualcomm vendor、接收端解码、声音、触控或长时间稳定性。
+
 ### 实测画面
 
 每张图只记录所拍会话。两张奇瑞图片是使用 **AI 图像编辑**从用户实拍生成的脱敏裁图：
@@ -64,7 +96,7 @@ Android 17，CarWith `4.0.20-20260923`，小米 CarLife `8.8.5`（早期 DiPlay 
 | 项目 | 已知情况 | 后续计划 | 优先级 |
 | --- | --- | --- | --- |
 | 车型覆盖范围 | 已在一条记录的奇瑞车机固件上验证手动无线路径；其他车型与固件仍未验证。 | 继续记录车型与接收端组合，并覆盖点火、冷启动和更多车机状态。 | 高 |
-| 手机品牌与系统版本 | 目前只在一套小米 17 Pro Max 配置上验证。桥接依赖 CarWith 和小米 CarLife 组件，其他 Android 品牌尚未验证，也可能不提供兼容服务。 | 建立手机、系统和 CarWith 版本兼容表；在具备兼容 CarWith 服务的前提下探索其他品牌。 | 高 |
+| 手机品牌与系统版本 | 2026-11-04 的 AVD 矩阵已覆盖小米 HyperOS OS1–OS4、CarWith 2.x–4.x 与小米 CarLife 8.6.8/260；实体设备证据仍限于一套小米 17 Pro Max 配置。其他 Android 品牌尚未验证，也可能不提供兼容服务。 | 在实体小米设备上复测代表性矩阵组合；在具备兼容 CarWith 服务的前提下探索其他品牌。 | 高 |
 | 会话稳定性 | 已记录的奇瑞车机固件上，两轮媒体累计约 107 分钟，最长约 99 分钟；手动锁屏仍可能结束会话。 | 保证自动息屏与手动锁屏不断连，并覆盖网络、蓝牙和媒体生命周期变化后的恢复。 | 高 |
 | 上车自动连接 | 已验证的实车路径由手机启动连接，再在车机蓝牙列表中选择手机。 | 在更多蓝牙状态下验证触发去重、取消、冷启动和失败恢复。 | 高 |
 | 方向盘控制 | 接收端上一曲／下一曲会转发给 CarWith，但完整方向盘按键与焦点状态矩阵尚未验证。 | 完成媒体键、暂停恢复、导航提示、电话打断和焦点状态回归。 | 高 |
@@ -84,7 +116,9 @@ Android 17，CarWith `4.0.20-20260923`，小米 CarLife `8.8.5`（早期 DiPlay 
    或在 Windows 电脑上运行 [WinPlay](https://github.com/Roylyl/WinPlay)。
    启动本机 CarWith 会话前，先断开其他 CarLife 接收端。
 
-CarWith 原生画面、音频和触控使用普通应用 Intent 和本机套接字，无需 root 或 Shizuku。
+具备公开入口的 CarWith 版本通过普通应用 Intent 和本机套接字接入原生画面、音频和触控。
+缺少该入口的旧版需要附着已启动的原厂会话、确认 root 后启动内部服务，或在 CarWith 设置页手动操作；
+普通 Shizuku shell 身份无法启动受签名权限保护的旧版服务。
 WinPlay 1.2.4、1.2.5 等接收端还会校验手机的真实蓝牙身份，而 Android 不允许普通应用直接读取：
 启动 [Shizuku](https://shizuku.rikka.app/) 后 mcarplay 会自动读取并保存；不用 Shizuku 时，
 在主界面「本机蓝牙地址」中填入手机设置里查到的蓝牙地址。Shizuku 实时读取优先于手动填写。
@@ -119,6 +153,9 @@ Debug 包通常无法覆盖更新为正式签名包；未记录发行标签的�
 点击首页 **导出脱敏诊断报告**，检查后分享文件，同时提供复现步骤、故障时间、接收端型号/固件和屏幕提示。
 意外退出后请重新打开并立即导出，不要先重装或清除数据。报告自动包含最近进程关键记录，
 无需电脑或 Shizuku，不会自动上传。详见 [诊断内容、错误码与排查方式](docs/DIAGNOSTICS.md)。
+
+`remote/debug` 诊断版在手机端告知后导出**完整、未脱敏报告**，可能包含真实设备/网络标识、
+原始异常和已记录的会话信息；已配置的调试桥也会传输运行日志。standard 版及所有 release 导出继续脱敏。
 
 ## 检测并记住当前车机
 
@@ -161,7 +198,8 @@ Debug 包通常无法覆盖更新为正式签名包；未记录发行标签的�
 
 ```bash
 ./gradlew spotlessCheck :app:testStandardDebugUnitTest \
-  :app:lintStandardDebug :app:assembleStandardDebug
+  :app:lintStandardDebug :app:assembleStandardDebug \
+  :app:testRemoteDebugUnitTest --tests 'com.mcarplay.app.bridge.*'
 ```
 
 APK 路径：`app/build/outputs/apk/standard/debug/app-standard-debug.apk`。
@@ -227,6 +265,16 @@ python3 -m venv .venv
 运行 `python3 tools/prepare_upload.py` 可在 `dist/` 下生成源码上传目录和 ZIP，
 排除本机 SDK 配置、签名文件、缓存、日志、抓包和参考 APK。
 使用 GitHub 网页上传时，需一并上传 `.github/` 和根目录的点文件。
+
+## Star 趋势
+
+<a href="https://www.star-history.com/#wangxso/mcarplay&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=wangxso/mcarplay&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=wangxso/mcarplay&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=wangxso/mcarplay&type=Date" />
+  </picture>
+</a>
 
 ## 开源致谢
 
