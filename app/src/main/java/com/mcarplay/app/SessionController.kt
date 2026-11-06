@@ -49,6 +49,8 @@ import com.mcarplay.app.input.ConsumerKeys
 import com.mcarplay.app.input.HidNavigation
 import com.mcarplay.app.input.MediaKeyEdge
 import com.mcarplay.app.input.TouchReports
+import com.mcarplay.app.media.AutoPlaySuppressor
+import com.mcarplay.app.media.MediaSessionsState
 import com.mcarplay.app.net.AirPlayFeatures
 import com.mcarplay.app.net.CarPlayCtrlAdvertiser
 import com.mcarplay.app.net.CarPlayServiceBrowser
@@ -62,6 +64,7 @@ import com.mcarplay.app.service.CarPlayService
 import com.mcarplay.app.service.ScreenLockMonitor
 import com.mcarplay.app.service.StreamingWifiLock
 import com.mcarplay.app.settings.DisplayPrefs
+import com.mcarplay.app.settings.MediaPrefs
 import com.mcarplay.app.shizuku.CarInputClient
 import com.mcarplay.app.shizuku.Shell
 import com.mcarplay.app.shizuku.ShizukuGate
@@ -255,6 +258,55 @@ object SessionController {
         audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
     }
 
+    /** 上车自动播放抑制状态；只在设置关闭时启用，见 [armAutoPlaySuppression]。 */
+    private val autoPlaySuppressor = AutoPlaySuppressor()
+    private var autoPlayListener: (() -> Unit)? = null
+    private val autoPlayHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val autoPlayTimeout = Runnable { stopAutoPlayWatch() }
+
+    /**
+     * 「上车自动播放音乐」关闭时，在 CarWith 连接后的一小段窗口内抑制自动播放：
+     *  - 前 [AutoPlaySuppressor.KEY_WINDOW_MILLIS] 内丢弃车机的播放键；
+     *  - [AutoPlaySuppressor.WATCH_WINDOW_MILLIS] 内音乐自行开始时暂停一次。
+     * 连接前已经在播放的音乐不处理；用户随后在车机上按播放会先解除抑制。
+     */
+    private fun armAutoPlaySuppression() {
+        stopAutoPlayWatch()
+        val context = appContext ?: return
+        if (MediaPrefs.autoPlayOnConnect(context)) return
+        if (MediaSessionsState.nowPlaying?.playing == true) {
+            appendLog("MEDIA: 上车自动播放已关闭——连接前已在播放，保持现状")
+            return
+        }
+        autoPlaySuppressor.arm(alreadyPlaying = false, nowMs = SystemClock.uptimeMillis())
+        val listener = {
+            if (MediaSessionsState.nowPlaying?.playing == true &&
+                autoPlaySuppressor.shouldPauseStartedPlayback(SystemClock.uptimeMillis())
+            ) {
+                appendLog("MEDIA: 上车自动播放已关闭——暂停连接后自行开始的音乐")
+                dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
+            }
+        }
+        autoPlayListener = listener
+        MediaSessionsState.addListener(listener)
+        autoPlayHandler.postDelayed(autoPlayTimeout, AutoPlaySuppressor.WATCH_WINDOW_MILLIS + 1_000L)
+        appendLog(
+            "MEDIA: 上车自动播放已关闭——${AutoPlaySuppressor.KEY_WINDOW_MILLIS / 1000}s 内忽略车机自动播放键，" +
+                if (MediaSessionsState.accessGranted) {
+                    "${AutoPlaySuppressor.WATCH_WINDOW_MILLIS / 1000}s 内暂停自行开始的音乐"
+                } else {
+                    "通知使用权未授予，无法识别自行开始的音乐"
+                },
+        )
+    }
+
+    private fun stopAutoPlayWatch() {
+        autoPlayListener?.let(MediaSessionsState::removeListener)
+        autoPlayListener = null
+        autoPlaySuppressor.disarm()
+        autoPlayHandler.removeCallbacks(autoPlayTimeout)
+    }
+
     /**
      * 车机/方向盘媒体键的统一出口（AirPlay `hidSendReport` 与 iAP2 0x6802 共用）。
      *
@@ -268,6 +320,13 @@ object SessionController {
         keyCode: Int,
         source: String,
     ) {
+        val isPlayKey = keyCode == KeyEvent.KEYCODE_MEDIA_PLAY || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+        if (isPlayKey && autoPlaySuppressor.shouldDropPlayKey(SystemClock.uptimeMillis())) {
+            appendLog("EVENT: 车机媒体键（$source）→ 已忽略（设置「上车自动播放音乐」已关闭）")
+            return
+        }
+        // 用户/车机主动按播放：解除观察窗口，别把它当成“自行开始”再暂停。
+        if (isPlayKey) autoPlaySuppressor.disarm()
         val hardKey = CarLifeProtocol.hardKeyFor(keyCode)
         if (hardKey != null && currentCarLifeSession?.sendHardKey(hardKey) == true) {
             appendLog("EVENT: 车机媒体键（$source）→ CarWith 硬按键 $hardKey")
@@ -641,6 +700,7 @@ object SessionController {
                     },
                     targetProvider = targetProvider,
                     diagnostics = bluetoothDiagnostics,
+                    onAdapterStateChanged = { state -> bluetoothServer?.onAdapterStateChanged(state) },
                     onAwaitingReceiverTap = { name ->
                         // 艾瑞泽 8 这类车机只能由车机端发起，需要用户在车机上操作（2026-11-02）
                         phaseHint = t(R.string.sc_tap_phone_on_receiver, name)
@@ -1108,6 +1168,7 @@ object SessionController {
     ) {
         currentClient?.beginOrderlyStop()
         screenStreamRecovery = null
+        stopAutoPlayWatch()
         val retiringSender = videoSender
         videoSender = null
         if (preserveScreenSocket) retiringSender?.quiesceForOrderlyStop() else retiringSender?.stop()
@@ -1164,10 +1225,41 @@ object SessionController {
         }
         if (audioSender?.isRunning == true) return
         appendLog("MODE: 会话进行中，动态补启音频通道…")
-        if (startAudioChannel(context, client, secret, currentAudioHost)) {
-            appendLog("AUDIO: 动态加入音频流——检查会话激活")
+        startAudioAndRecord(context, client, secret, currentAudioHost, "AUDIO: 动态加入音频流——检查会话激活")
+    }
+
+    /** 启动音频并在成功后补 RECORD；连接、动态补启和仲裁重试三条入口共用。 */
+    private fun startAudioAndRecord(
+        context: Context,
+        client: AirPlayClient,
+        secret: ByteArray?,
+        host: String?,
+        logLine: String,
+    ): Boolean {
+        val started = startAudioChannel(context, client, secret, host)
+        if (started) {
+            appendLog(logLine)
             client.record()
         }
+        return started
+    }
+
+    /**
+     * claim 因车机约束被拒后，`changeModes` 归还主音频时重试一次音频通道。
+     * 只由 [ModeArbiter.consumeAudioClaimRetry] 触发；仍受音频开关、会话代次和发送器状态约束。
+     */
+    private fun retryAudioAfterClaimReturned(client: AirPlayClient) {
+        // 只把状态检查放在短临界区里；SETUP 最长数秒，不能占着会话锁（disconnect 是
+        // @Synchronized，UI 线程点“断开”会跟着卡住）。
+        val ready =
+            synchronized(this) {
+                if (client !== currentClient || client.sessionStopping || !audioEnabledForSession) return
+                if (audioSender?.isRunning == true) return
+                val context = appContext ?: return
+                val secret = currentSharedSecret ?: return
+                Triple(context, secret, currentAudioHost)
+            }
+        startAudioAndRecord(ready.first, client, ready.second, ready.third, "AUDIO: 车机归还主音频后音频流已建立——检查会话激活")
     }
 
     /**
@@ -2170,6 +2262,19 @@ object SessionController {
                     "（本车机记忆：${AudioProfileMemory.describe(entry)}；" +
                     "封装=${tuning.detail}）",
             )
+            // 真 iPhone 在 Main audio setting up 之前先报 mainAudio controller；车机持有
+            // 或借用主音频时直接 SETUP 会被 VW4131 以 400 拒绝，不能误判成三档格式都不兼容。
+            val audioClaim = client.claimMainAudioForStreaming(connectionGeneration)
+            if (!audioClaim.claimed) {
+                // 车机以高于 userInitiated 的约束持有/借用主音频（如倒车提示音）：不抢、不发 SETUP，
+                // 否则三档 400 会被写成格式失败记忆；等 changeModes 归还后再重试。
+                appendLog("AUDIO: 主音频资源未接管（${audioClaim.note}）——本次不发送 SETUP，等车机归还主音频后重试")
+                return false
+            }
+            appendLog(
+                "AUDIO: 音频流建立前主音频资源" +
+                    if (audioClaim.announced) "已报归手机" else "切换未确认（继续尝试 SETUP）",
+            )
             // SETUP 失败不会扰动会话（车机只是不接这条流的请求），所以本会话内就把候选
             // 试完，不必等下一次连接。这一点对当前场景很关键：102/AAC-LC 与 100/PCM 是
             // 两条完全不同的通路，前者不被接受时应当立刻退到后者，而不是让用户白连一次。
@@ -2177,15 +2282,24 @@ object SessionController {
             var streamInfo: AirPlayClient.AudioStreamInfo? = null
             for (candidate in ordered) {
                 if (!client.isConnectionCurrent(connectionGeneration)) return false
+                if (!client.modes.phoneOwnsAudio) {
+                    appendLog("AUDIO: 主音频资源在协商期间转为车机占用——停止候选轮换，不记为格式失败")
+                    return false
+                }
                 val result = client.runAudioStream(sharedSecret, candidate, tuning, expectedEpoch = connectionGeneration)
                 if (result != null) {
                     chosen = candidate
                     streamInfo = result
                     break
                 }
+                if (!client.modes.phoneOwnsAudio) {
+                    appendLog("AUDIO: 主音频 SETUP 被拒时资源已归车机——不记为格式失败")
+                    return false
+                }
                 // SETUP 被拒不等于「车机不兼容」：可能只是资源仲裁/网络抖动，
                 // 不能据此把整台车机的音频判死（置 disabled 只认「拆链」证据）。
-                if (identity.isNotBlank()) {
+                // 只有 modesChanged 已确认手机持有主音频时，失败才可作为格式证据。
+                if (audioClaim.announced && identity.isNotBlank()) {
                     AudioProfileMemory.recordRejected(
                         context.applicationContext,
                         identity,
@@ -3560,6 +3674,10 @@ object SessionController {
                                         // 旧实现一律回「手机持有」，帕萨特回主界面后再点图标就切不回 CarPlay（2026-11-01 22:47）
                                         val note = client.modes.onChangeModes(command["params"] as? Map<*, *>)
                                         enqueueModesAssert(client, "车机请求 changeModes（→ $note）", requestKeyFrame = false)
+                                        if (client.modes.consumeAudioClaimRetry()) {
+                                            appendLog("AUDIO: 车机已归还主音频——后台重试建立音频流")
+                                            Bg.run("audio-claim-retry") { retryAudioAfterClaimReturned(client) }
+                                        }
                                     }
 
                                     "requestUI" -> {
@@ -3693,6 +3811,11 @@ object SessionController {
                                                 keepAliveWithStats = setup.keepAliveSendStatsAsBody,
                                                 externalVideoSource = carLifeSource,
                                                 receiverMaxFps = setup.maxFps,
+                                                // 车机拿走主屏（原车界面、倒车影像等）时暂停屏幕视频，归还后从新的 IDR 恢复
+                                                phoneOwnsScreen = { client.modes.phoneOwnsScreen },
+                                                onScreenOutputSuspended = { suspended ->
+                                                    ConnectionDiagnostics.timeline.screenOutput(diagnosticAttempt, suspended)
+                                                },
                                                 onExternalFrameSent = { bytes ->
                                                     ConnectionDiagnostics.timeline.media(diagnosticAttempt, true, bytes)
                                                     val now = android.os.SystemClock.uptimeMillis()
@@ -3867,6 +3990,9 @@ object SessionController {
                                         )
                                     }
                                     if (videoStarted) carLifeOutput = output
+                                    // 在 CarWith 启动前布防：CarWith 可能在 start() 内就恢复媒体，
+                                    // 启动后再取 nowPlaying 会把自动播放误当成“连接前已在播放”。
+                                    if (videoStarted) armAutoPlaySuppression()
                                     val carLifeStarted = videoStarted && createdCarLife.start()
                                     appendLog(
                                         "MODE: CarWith ${if (carLifeStarted) "已请求连接，等待真实视频" else "连接请求失败"} " +
@@ -3879,6 +4005,7 @@ object SessionController {
                                     if (carLifeStarted) {
                                         appendLog("SCREEN: CarWith 尚未收到首帧，保持手机可见以完成原厂连接")
                                     } else {
+                                        stopAutoPlayWatch()
                                         ConnectionDiagnostics.timeline.finish(diagnosticAttempt, DiagnosticCode.CARWITH_FAILED, true)
                                         if (carLifeOutput === output) carLifeOutput = null
                                         releaseCarLifeSession(createdCarLife)
@@ -3886,14 +4013,23 @@ object SessionController {
                                 }
                                 // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。
                                 // 会话已激活（RECORD 完成）后再协商；失败不影响视频主链路。
-                                val audioStarted = startAudioChannel(context, client, sessionKey, host)
-                                if (audioEnabledForSession && !audioStarted) {
+                                val audioStarted =
+                                    startAudioAndRecord(
+                                        context,
+                                        client,
+                                        sessionKey,
+                                        host,
+                                        // 奥迪曾需流后补发；受影响车机由客户端策略跳过重复 RECORD。
+                                        "AUDIO: 音频流已加入——检查会话激活",
+                                    )
+                                // 主音频被车机约束占用时的“未启动”不是音频故障：不写结论码，
+                                // 否则它会长期盖住后续真正需要的诊断（如屏幕暂停）。
+                                if (audioEnabledForSession &&
+                                    !audioStarted &&
+                                    !client.modes.audioClaimAwaitingReturn &&
+                                    client.modes.phoneOwnsAudio
+                                ) {
                                     ConnectionDiagnostics.timeline.issue(diagnosticAttempt, DiagnosticCode.AUDIO_UNAVAILABLE)
-                                }
-                                if (audioStarted) {
-                                    // 奥迪曾需流后补发；受影响车机由客户端策略跳过重复 RECORD。
-                                    appendLog("AUDIO: 音频流已加入——检查会话激活")
-                                    client.record()
                                 }
                             }
                         } else {

@@ -12,6 +12,10 @@
     <string name="dc_setup_failed">The CarPlay session was not set up; send a diagnostic report so the receiver\'s response can be checked</string>
     <string name="dc_carwith_failed">CarWith did not start streaming; check the component versions, the factory connection switch and permissions</string>
     <string name="dc_carwith_entry_blocked">CarWith could not be opened while the app was in the background; on Xiaomi allow \"Display pop-up windows while running in the background\", or keep mcarplay in the foreground and reconnect</string>
+    <string name="dc_carwith_entry_not_observed">No CarWith notification was observed while waiting for the seven ports, and the listeners did not become ready; keep mcarplay in the foreground, open CarWith settings, select Baidu CarLife wireless connection manually and try again</string>
+    <string name="dc_carwith_entry_status_unknown">The seven ports did not become ready, and without a bound notification listener the app cannot tell whether the CarWith entry ran; start Baidu CarLife wireless connection manually from CarWith settings. Allow mcarplay notification access to improve the next diagnosis</string>
+    <string name="dc_carwith_listeners_pending">A CarWith notification was observed, but the seven ports did not become ready; open CarWith settings, select Baidu CarLife wireless connection manually and check the CarWith/CarLife component versions</string>
+    <string name="dc_carwith_protocol_silent">The seven ports connected, but no CarLife protocol response arrived; listening sockets do not prove a valid cast session. Stop the existing CarWith connection, start Baidu CarLife wireless connection again from CarWith settings, then retry</string>
     <string name="dc_carwith_busy">CarWith is busy with the self-test; stop the self-test before starting CarPlay</string>
     <string name="dc_video_closed">The video connection ended; this alone does not mean the receiver crashed, so check the network and receiver</string>
     <string name="dc_audio_unavailable">Audio could not be enabled; video can continue. Send a report so the audio negotiation can be checked</string>
@@ -35,6 +39,7 @@
     <string name="status_failed">failed</string>
     <string name="status_stopped">ended</string>
     <string name="summary_header">Session %1$s · %2$s · %3$s · %4$ds</string>
+    <string name="summary_video_paused">The main screen belongs to the head unit, so screen video is paused until it returns and a fresh key frame arrives</string>
     <string name="summary_video_stalled">No new video frame sent in the last %1$ds; check the receiver\'s picture and export a report</string>
     <string name="summary_source_only">CarWith video received, but no frame has been sent to the receiver yet</string>
     <string name="summary_waiting_carwith">Still waiting for the first CarWith frame; check the factory permissions and export a report</string>

@@ -32,6 +32,22 @@ enum class DiagnosticCode(
     SETUP_FAILED("CarPlay 会话未建立，请提供诊断报告核对接收端响应"),
     CARWITH_FAILED("CarWith 未完成出流，请检查组件版本、原厂连接开关和授权"),
     CARWITH_ENTRY_BLOCKED("应用在后台时未能打开 CarWith 入口；小米请在应用权限中允许「后台弹出界面」，或保持 mcarplay 在前台后重连"),
+    CARWITH_ENTRY_NOT_OBSERVED(
+        "等待七路连接期间未观察到 CarWith 通知，端口也未就绪；请保持 mcarplay 在前台，" +
+            "打开 CarWith 设置手动选择百度 CarLife 无线连接后重试",
+    ),
+    CARWITH_ENTRY_STATUS_UNKNOWN(
+        "七路端口未就绪，且未绑定通知监听器，无法判断 CarWith 入口是否执行；" +
+            "请从 CarWith 设置手动发起百度 CarLife 无线连接；可允许 mcarplay 的通知使用权供下次诊断",
+    ),
+    CARWITH_LISTENERS_PENDING(
+        "已观察到 CarWith 通知，但七路端口未就绪；请打开 CarWith 设置手动选择百度 CarLife 无线连接，" +
+            "并核对 CarWith/CarLife 组件版本",
+    ),
+    CARWITH_PROTOCOL_SILENT(
+        "七路端口已连接，但未收到 CarLife 协议响应；端口监听不等于有效投屏会话。" +
+            "请停止现有 CarWith 连接，再从 CarWith 设置重新发起百度 CarLife 无线连接",
+    ),
     CARWITH_BUSY("CarWith 正被独立自检占用，请先停止自检，再启动 CarPlay 连接"),
     VIDEO_CLOSED("视频连接已结束；仅凭此不能确认接收端崩溃，请检查网络和接收端"),
     AUDIO_UNAVAILABLE("音频未能启用，画面可以继续；请提供报告核对音频协商"),
@@ -62,6 +78,8 @@ class ConnectionTimeline(
         val startedAtMs: Long,
         val stage: ConnectionStage,
         val status: String,
+        /** 主屏不归手机，屏幕视频已被门控暂停；此时 lastVideoMsAgo 增长不代表传输停滞。 */
+        val screenSuspended: Boolean,
         val elapsedMs: Long,
         val code: DiagnosticCode?,
         val videoFrames: Long,
@@ -91,6 +109,8 @@ class ConnectionTimeline(
             "会话 $id · ${stage.label} · $statusLabel · ${elapsedMs / 1000}s\n" +
                 (
                     code?.let { "${it.name}：${it.advice}" } ?: when {
+                        screenSuspended ->
+                            "主屏由车机持有，屏幕视频已暂停；等待主屏归还并收到新的关键帧"
                         status == "streaming" && (lastVideoMsAgo ?: 0) >= 5000 ->
                             "最近 ${(lastVideoMsAgo ?: 0) / 1000}s 未发出新视频帧；请确认接收端画面，并导出报告"
                         sourceFrames > 0 && videoFrames == 0L && stage != ConnectionStage.SELF_TEST -> "已收到 CarWith 视频，尚未向接收端发出视频帧"
@@ -113,6 +133,7 @@ class ConnectionTimeline(
     private var startedAtMs = 0L
     private var stage = ConnectionStage.PRECHECK
     private var status = "waiting"
+    private var screenSuspended = false
     private var code: DiagnosticCode? = null
     private var started = 0L
     private var frames = 0L
@@ -135,6 +156,7 @@ class ConnectionTimeline(
             startedAtMs = wallTime()
             stage = ConnectionStage.PRECHECK
             status = "waiting"
+            screenSuspended = false
             code = null
             started = elapsedTime()
             endedAt = null
@@ -273,6 +295,22 @@ class ConnectionTimeline(
             }
         }
 
+    /**
+     * 主屏归属导致的屏幕视频暂停/恢复。暂停期间 [Snapshot.lastVideoMsAgo] 继续增长是预期行为，
+     * 不能按传输停滞报警；恢复以新的 IDR 已发送为准。
+     */
+    fun screenOutput(
+        attempt: String,
+        suspended: Boolean,
+    ) = mutate {
+        if (id != attempt || !active() || screenSuspended == suspended) return@mutate
+        screenSuspended = suspended
+        emit(
+            "SCREEN_OUTPUT",
+            if (suspended) "主屏归车机，屏幕视频已暂停" else "主屏视频已由新的 IDR 恢复",
+        )
+    }
+
     fun audioPacket(attempt: String) =
         mutate {
             if (id != attempt || !active()) return@mutate
@@ -295,6 +333,7 @@ class ConnectionTimeline(
                 startedAtMs,
                 stage,
                 status,
+                screenSuspended,
                 ((endedAt ?: elapsedTime()) - started).coerceAtLeast(0),
                 code,
                 frames,
@@ -361,6 +400,7 @@ class ConnectionTimeline(
                 .put("event", event)
                 .put("stage", state.stage.name)
                 .put("status", state.status)
+                .put("screenSuspended", state.screenSuspended)
                 .put("elapsedMs", state.elapsedMs)
                 .put("code", state.code?.name ?: "NONE")
                 .put("videoFrames", state.videoFrames)
