@@ -28,6 +28,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.DrawableCompat
+import com.mcarplay.app.bt.AutoReconnectGuard
 import com.mcarplay.app.bt.TargetDevicePrefs
 import com.mcarplay.app.carlife.CarLifeDiagnostics
 import com.mcarplay.app.carlife.CarLifeLauncher
@@ -134,6 +135,9 @@ class MainActivity : AppCompatActivity() {
 
     // ---- 英雄卡状态机（1s 轮询 SessionController 对账）----
     private var heroState: HeroState? = null
+
+    /** 首页是否正显示「自动重连已暂停」；熔断到期后需要恢复默认空闲文案。 */
+    private var idleAutoPauseShown = false
     private var connectedAt = 0L
 
     // 启动残留屏检查进行中（英雄卡显示「检查中」）；发现的残留暂缓清理时
@@ -965,8 +969,8 @@ class MainActivity : AppCompatActivity() {
                     return@runOnUiThread
                 }
                 var answered = false
-                // 取消（返回键/点外部/被 cancelConnecting 联动关闭）= null，流程据此中止；
-                // 「打开 WLAN」除了回调 false，还要把用户送到系统 WLAN 页手动连。
+                // 取消（返回键/点外部/被 cancelConnecting 联动关闭）= null，流程据此中止。
+                // 弹窗只返回选择；是否打开 WLAN 设置由调用方决定，避免「继续等待」被误解成跳转。
                 val dialog =
                     DarkMessageDialog.show(
                         activity = this,
@@ -976,11 +980,6 @@ class MainActivity : AppCompatActivity() {
                             listOf(
                                 DarkMessageDialog.Action(spec.negative) {
                                     answered = true
-                                    runCatching {
-                                        startActivity(
-                                            android.content.Intent(android.provider.Settings.ACTION_WIFI_SETTINGS),
-                                        )
-                                    }
                                     onChoice(false)
                                 },
                                 DarkMessageDialog.Action(
@@ -1197,6 +1196,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.btnCarWithSettings).setOnClickListener {
             if (!CarLifeLauncher.openSettings(this)) snack(getString(R.string.ma_carwith_settings_failed))
         }
+        findViewById<View>(R.id.btnNotificationAccess).setOnClickListener { openNotificationAccessSettings() }
+        findViewById<View>(R.id.rowNotificationAccess).setOnClickListener { openNotificationAccessSettings() }
+        updateNotificationAccessRow()
         findViewById<TextView>(R.id.btnWifi).setOnClickListener {
             val ssid = ssidInput.text.toString().trim()
             // 自动加入不可用时的手动兜底：密码先进剪贴板，系统 WLAN 页粘贴即可
@@ -1377,7 +1379,13 @@ class MainActivity : AppCompatActivity() {
                 text.setSpan(StyleSpan(Typeface.BOLD), start, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
         }
-        DiagnosticText.progressDetail(this, progress).takeIf { it.isNotEmpty() }?.let { text.append("\n").append(it) }
+        DiagnosticText
+            .progressDetail(
+                this,
+                progress,
+                arrizo8 = SessionController.currentReceiverUsesArrizo8Hint(),
+            ).takeIf { it.isNotEmpty() }
+            ?.let { text.append("\n").append(it) }
         view.text = text
         view.visibility = View.VISIBLE
     }
@@ -1430,6 +1438,26 @@ class MainActivity : AppCompatActivity() {
             heroStateText.text =
                 getString(if (s == HeroState.CONNECTING) R.string.ma_hero_waiting_reconnect else R.string.ma_hero_incomplete)
             heroSubline.text = diagnosis.code?.let { DiagnosticText.advice(this, it) }
+        }
+        // 自动重连熔断：空闲时明确告诉用户「不是没连上，是暂缓自动重连」，并给出剩余时间。
+        // 有残留屏要清理时让残留提示优先（用户需要先处理那一项）。
+        if (s == HeroState.IDLE && pendingResidualDisplays == null) {
+            val block = AutoReconnectGuard.activeBlock(this)
+            if (block != null) {
+                idleAutoPauseShown = true
+                heroStateText.text = getString(R.string.main_hero_auto_paused)
+                heroSubline.text =
+                    getString(R.string.main_hero_auto_paused_hint, block.failures, block.remainingSeconds.toInt())
+            } else if (idleAutoPauseShown) {
+                idleAutoPauseShown = false
+                if (diagnosis?.status == "failed") {
+                    heroStateText.text = getString(R.string.ma_hero_incomplete)
+                    heroSubline.text = diagnosis.code?.let { DiagnosticText.advice(this, it) }
+                } else {
+                    heroStateText.text = getString(R.string.main_hero_idle)
+                    heroSubline.text = getString(R.string.main_hero_idle_hint)
+                }
+            }
         }
         // 启动残留屏检查进行中：状态与副标题临时切换为检查提示
         if (s == HeroState.IDLE && startupCheckRunning) {
@@ -1491,6 +1519,25 @@ class MainActivity : AppCompatActivity() {
                 if (running) R.string.carlife_self_test_stop else R.string.carlife_self_test_start,
             )
         carLifeSelfTestDesc.text = CarLifeDiagnostics.status(this)
+    }
+
+    /** 通知使用权是音乐卡与 CarWith 入口诊断的共同前置条件：显示状态并提供系统设置入口。 */
+    private fun updateNotificationAccessRow() {
+        val granted = NotificationAccess.isGrantedInSettings(this)
+        findViewById<TextView>(R.id.notificationAccessDesc).text =
+            getString(
+                if (granted) {
+                    R.string.diag_notification_access_desc_granted
+                } else {
+                    R.string.diag_notification_access_desc_missing
+                },
+            )
+    }
+
+    private fun openNotificationAccessSettings() {
+        if (!NotificationAccess.openSettings(this)) {
+            snack(getString(R.string.diag_notification_access_unavailable))
+        }
     }
 
     private fun toggleExternalHu() {
@@ -1776,6 +1823,8 @@ class MainActivity : AppCompatActivity() {
         }
         // 横屏时英雄卡是 contentArea 里的固定层（见 applyContentLayout），只属于连接页
         findViewById<View>(R.id.heroCard).visibility = if (index == 0) View.VISIBLE else View.GONE
+        // 用户可能刚从系统设置返回：进入诊断页时刷新授权状态。
+        if (index == 2) updateNotificationAccessRow()
     }
 
     private fun setReadyExpanded(expanded: Boolean) {
@@ -2171,6 +2220,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         SessionController.onMainUiVisibilityChanged(true)
         mainHandler.post(heroTick)
+        updateNotificationAccessRow()
         // 旋转/重建后尚未接受：用原截止时刻续弹（不重新等 10 秒）
         if (needsDisclaimerAtLaunch(
                 DisclaimerPrefs.acceptedVersion(this),
