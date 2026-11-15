@@ -46,6 +46,7 @@ import com.mcarplay.app.diagnostics.ConnectionMilestone
 import com.mcarplay.app.diagnostics.ConnectionStage
 import com.mcarplay.app.diagnostics.ConnectionStagePolicy
 import com.mcarplay.app.diagnostics.DiagnosticCode
+import com.mcarplay.app.diagnostics.DiagnosticRedactor
 import com.mcarplay.app.diagnostics.StreamEnvironment
 import com.mcarplay.app.i18n.AppLanguage
 import com.mcarplay.app.iap2.Iap2MessageIds
@@ -705,6 +706,8 @@ object SessionController {
     @Synchronized
     fun cancelConnecting(context: Context) {
         appendLog("SESSION: 用户取消连接——正在停止蓝牙/WiFi 链路")
+        // 用户已明确中止：上一轮弹窗的答案不能留给下一次连接复用。
+        wifiPromptBroker.clear()
         // disconnect 第一步 blockNewHandoffs() 即强制释放互斥：配对流程线程可能阻塞在
         // 不可中断的连接/mDNS 等待上（如手机不在热点网段时连热点 IP），finally 遥遥无期——
         // 用户显式取消即解锁，否则英雄卡永久「正在连接」（旧流程产出已被 retireSession 清理，无冲突）
@@ -956,6 +959,8 @@ object SessionController {
         val message: String,
         val positive: String,
         val negative: String,
+        /** 本次询问的标识：取消等待时只关这一次的弹窗，不误关后续轮次的提问。 */
+        val requestId: Long = 0L,
     )
 
     /**
@@ -964,6 +969,29 @@ object SessionController {
      */
     @Volatile
     var dialogSink: ((DialogSpec, onChoice: (Boolean?) -> Unit) -> Unit)? = null
+
+    /**
+     * 同一轮连接内相同问题（且同一张网络）的弹窗单飞：0x5703 与 0x4301 两条后台链路
+     * 可能同时走到「使用当前 Wi-Fi？」，只显示一次并复用答案。随新一轮连接清空。
+     */
+    private val wifiPromptBroker =
+        WifiPromptBroker<DialogSpec, WifiNetworkToken<Network>>(
+            tokensMatch = { shown, current -> shown.matches(current.network, current.ssid) },
+        )
+
+    /**
+     * 关闭仍在等待的某一次询问（参数与 [DialogSpec.requestId] 相同）。
+     *
+     * [WifiPromptBroker] 只负责「停止等待」，不会关掉已经显示的 AlertDialog：取消连接或
+     * 蓝牙拆链让等待提前返回后，弹窗仍留在屏上无人消费（用户会看到一个点了也没用的框）。
+     * 等待方退出时必须同时撤框，因此按 requestId 单独登记。
+     */
+    @Volatile
+    var dialogDismissSink: ((Long) -> Unit)? = null
+
+    private val dialogRequestIds =
+        java.util.concurrent.atomic
+            .AtomicLong()
 
     private fun ensureSessionObjects(context: Context) {
         if (bluetoothServer != null) return
@@ -1003,6 +1031,7 @@ object SessionController {
                     onWifiCredentials = wifiCredentialHook,
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "车机回连") },
                     onLinkClosed = ::onSenderLinkClosed,
+                    onPreEndpointFailure = ::onPreEndpointRoundFailed,
                     knownCarSsid = ::knownCarHotspotSsid,
                     receiverInvited = ::receiverHasInvited,
                     onObservation = ::onReceiverObservation,
@@ -1021,6 +1050,7 @@ object SessionController {
                     onWifiCredentials = wifiCredentialHook,
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "主动连车机") },
                     onLinkClosed = ::onSenderLinkClosed,
+                    onPreEndpointFailure = ::onPreEndpointRoundFailed,
                     knownCarSsid = ::knownCarHotspotSsid,
                     receiverInvited = ::receiverHasInvited,
                     onObservation = ::onReceiverObservation,
@@ -1284,6 +1314,8 @@ object SessionController {
         // 会话进行中再次调用（如上车自动连接在车机蓝牙重连时触发）不得清零：邀请时刻与重试次数
         // 还在被当前会话使用（帕萨特 2026-11-01 21:45：RECORD 后蓝牙断开 4.5 s 又连上，计数被中途清零）
         if (!alreadyRunning) {
+            // 上一轮弹窗的答案不代表用户这一次的选择：新一轮从干净状态开始。
+            wifiPromptBroker.clear()
             ctrlAdvertiser?.resetInviteCount()
             ctrlInviteEvidence = null
             pendingStartSessionEndpoint.set(null)
@@ -1417,6 +1449,104 @@ object SessionController {
         } else {
             appendLog("已${endAction}并停止保活服务（常亮已恢复）")
         }
+    }
+
+    /**
+     * Phase 1（拿到端点）之前就失败的 BT 轮次。
+     *
+     * [Iap2BluetoothServer]/[Iap2BluetoothClient] 的 `onLinkClosed` 只在已交付端点后触发
+     * （语义是「已交付会话的链路断了」），因此协商超时/识别失败/车机在 Phase 1 拆链这类
+     * 轮次此前只写一行 `SESSION 失败`：时间线不会结束，`elapsedMs` 一直累加到诊断报告里，
+     * 熔断也完全看不到这些失败（bug #66：保时捷退化 0x1d01 反复协商重启，卡在
+     * BLUETOOTH:WIFI_INFO 224s+，自动重连无限重试）。
+     *
+     * 只结束仍处于建立阶段的当前时间线，并在本轮仍是当前轮次、当前对端时记账；
+     * 用户断开/正在收尾、以及已被新一轮取代的轮次一律不动。
+     *
+     * 两个出口都必须处理，否则熔断在 #66 的形态下永远到不了阈值：
+     * - **未触发熔断时**立刻开一条新的 BLUETOOTH 时间线。客户端/服务端在线路断开后会在
+     *   自己的循环里再起一轮 `runSession`，但那不会调用 [startConnection]；若沿用刚结束的
+     *   attempt，之后每轮都因 status=failed 被 [settlesOnPreEndpointFailure] 拒绝，而
+     *   `recordFastFailure` 又按 attempt 去重，于是连续失败永远只记 1 次。
+     * - **触发熔断后**必须真正停掉 BT 客户端/服务端（与 [disconnect] 同路），否则只写一行
+     *   日志、它们的循环仍在重启会话，冷却期形同虚设。此时**不得**再开新 attempt：
+     *   [disconnect] 会取当前时间线 id 再记一次失败，把第 3 次改写成第 4 次。
+     */
+    private fun onPreEndpointRoundFailed(
+        reason: String,
+        peerAddress: String?,
+    ) {
+        if (isDisconnecting() || connectCancelled) return
+        if (!peerUnknownOrMatches(peerAddress, activePeerAddress)) {
+            appendLog(">>> 非本轮蓝牙链路（$peerAddress）在端点前结束——忽略（本轮 ${activePeerAddress ?: "未知"}）")
+            return
+        }
+        val app = appContext ?: return
+        val snapshot = ConnectionDiagnostics.timeline.snapshot() ?: return
+        // 空端点（等晚到 0x4301）也停在 waiting+BLUETOOTH，但那是**有意**的等待，
+        // 由 watchForPendingStartSession 自己收尾，不能被别的链路在这里结束。
+        // 还有别的链路活着时同样不判定：无法证明这条失败属于正在等待的那一轮，
+        // 宁可少收尾一次，也不能把别家的失败记到当前轮次头上（会误触发熔断）。
+        // 必须用 hasAny() 而不是 single()!=null：只要有未知身份的链路、或剩下两条以上
+        // 已知链路，single() 就返回 null，那正是「还有链路在协商/即将交付端点」的情形。
+        // 目标形态（协商超时后车机才重连）里失败链路已从集合移除，hasAny() 为 false。
+        if (!settlesOnPreEndpointFailure(
+                status = snapshot.status,
+                stage = snapshot.stage,
+                waitingForLateEndpoint = pendingStartSessionEndpoint.get() != null,
+                anotherLinkLive = activeReceiverObservations.hasAny(),
+            )
+        ) {
+            return
+        }
+        ConnectionDiagnostics.timeline.finish(
+            snapshot.id,
+            DiagnosticCode.BT_LINK_CLOSED,
+            true,
+            "endpoint not delivered: ${DiagnosticRedactor.scrubAtSource(reason).take(120)}",
+        )
+        // 与其它失败出口共用同一套判据，只额外说明这是「端点交付前」的轮次：
+        // 这类轮次从未进入界面交接，不受 60s 快速失败门限约束（见
+        // [countsAsAutoReconnectFailure] 的 beforeEndpoint）。
+        val ended = ConnectionDiagnostics.timeline.snapshot() ?: return
+        if (!countsAsAutoReconnectFailure(DiagnosticCode.BT_LINK_CLOSED, ended.videoFrames, ended.elapsedMs, beforeEndpoint = true)) {
+            return
+        }
+        val blocked = AutoReconnectGuard.recordFastFailure(app, peerAddress, snapshot.id)
+        if (blocked == null) {
+            // 未触发熔断：本轮时间线已结束，仍在运行的 BT 循环需要自己的 attempt（见上方 KDoc）。
+            beginPreEndpointRetryAttempt()
+            return
+        }
+        appendLog(
+            "AUTO: 连续 ${blocked.failures} 轮在端点交付前失败——暂停自动重连 ${blocked.remainingSeconds} 秒" +
+                "（可在 App 内手动连接）",
+        )
+        // 熔断必须真正生效：只写日志的话，仍在运行的 BT 循环会马上再拉一轮。
+        // 与 onSenderLinkClosed 触发熔断时同样走 disconnect（BT_LINK_CLOSED 不是用户停止，
+        // 不会清空熔断状态）。
+        //
+        // 这里**不能**先开新 attempt：disconnect 会取当前时间线的 id 再记一次失败
+        // （disconnect → finishCurrent/recordAutoReconnectOutcome）。那样会把
+        // failures 从 3 改成 4、再延长一次冷却期，并把 recordedAttempt 改写成一条
+        // 几乎零时长的合成轮次，支撑报告也就看不到真正触发熔断的那一轮。
+        appContext?.let { disconnect(it, DiagnosticCode.BT_LINK_CLOSED) }
+    }
+
+    /**
+     * 未触发熔断、端点前失败的轮次结束后，为仍在运行的 BT 循环准备一条新的 BLUETOOTH 时间线。
+     *
+     * 只在「本轮尚未触发熔断」且确实还有 BT 组件在跑时调用：触发熔断后调用方会走
+     * [disconnect]，它会按当前时间线 id 再记一次失败；此时若先造一条空 attempt，
+     * 会把熔断次数与冷却期改写。真正收尾（用户断开/熔断）之后也不得凭空造出一条
+     * 会一直累加 `elapsedMs` 的 waiting 记录。
+     */
+    private fun beginPreEndpointRetryAttempt() {
+        if (isDisconnecting() || connectCancelled) return
+        if (bluetoothClient?.isRunning != true && bluetoothServer?.isRunning != true) return
+        val attempt = ConnectionDiagnostics.begin("bt_retry")
+        bluetoothDiagnostics.begin(attempt)
+        ConnectionDiagnostics.timeline.stage(attempt, ConnectionStage.BLUETOOTH)
     }
 
     /**
@@ -1840,7 +1970,7 @@ object SessionController {
         if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
         // SSID 已核对，但必须拿到同一张 Wi-Fi 的 Network 句柄再绑：通配 requestNetwork
         // 在两张 Wi-Fi 并存时可能先返回另一张（句柄交给用户确认路径去取）。
-        val verified = connector.verifiedWifiNetwork(wifi.ssid)
+        val verified = verifiedWifiNetworkFor(wifi.ssid)
         if (verified == null) {
             appendLog("WIFI: 已连在车机热点但拿不到核验过的 Network 句柄——转用户确认，不发起通配绑定")
             return WifiCarPlayConnector.JoinResult.Unavailable
@@ -1865,7 +1995,7 @@ object SessionController {
         isCancelled: () -> Boolean = { connectCancelled },
         onResult: (Boolean) -> Unit,
     ) {
-        val verified = wifiConnector?.verifiedWifiNetwork(ssid)
+        val verified = verifiedWifiNetworkFor(ssid)
         if (verified != null) {
             onResult(bindCarWifiAndRegister(ssid, verified, isCancelled))
             return
@@ -2086,7 +2216,7 @@ object SessionController {
         ssid: String,
         verifySsid: Boolean = true,
     ): Network? {
-        val verifiedNetwork = if (verifySsid) connector.verifiedWifiNetwork(ssid) else connector.currentWifiNetwork()
+        val verifiedNetwork = if (verifySsid) verifiedWifiNetworkFor(ssid) else connector.currentWifiNetwork()
         if (verifiedNetwork != null) {
             return if (connector.bindVerifiedNetwork(verifiedNetwork, ssid)) verifiedNetwork else null
         }
@@ -2182,7 +2312,7 @@ object SessionController {
     }
 
     /** WiFi 未开启时的引导与等待；true = 已开启可继续。 */
-    private fun waitForWifiEnabled(): Boolean {
+    private fun waitForWifiEnabled(isCancelled: () -> Boolean = { connectCancelled }): Boolean {
         val open =
             askWifiJoinChoice(
                 DialogSpec(
@@ -2191,8 +2321,9 @@ object SessionController {
                     positive = t(R.string.sc_open_wifi_settings),
                     negative = t(R.string.sc_cancel),
                 ),
+                isCancelled = isCancelled,
             )
-        if (connectCancelled) return false
+        if (isCancelled()) return false
         when (open) {
             true -> {
                 openWlanSettings()
@@ -2212,7 +2343,8 @@ object SessionController {
             }
         }
         var waited = 0
-        while (shellWifiDisabled() && waited < WLAN_WAIT_TIMEOUT_MS && !connectCancelled) {
+        // 用调用方的判据而不是全局标志：交接被别的链路接手时全局标志可能仍为 false。
+        while (shellWifiDisabled() && waited < WLAN_WAIT_TIMEOUT_MS && !isCancelled()) {
             if (waited == 0) {
                 phaseHint = t(R.string.sc_waiting_wifi)
                 appendLog("WIFI: 等待用户打开 WLAN（最长 120 秒，取消连接可中止）")
@@ -2220,7 +2352,7 @@ object SessionController {
             Thread.sleep(2_000)
             waited += 2_000
         }
-        if (connectCancelled) {
+        if (isCancelled()) {
             phaseHint = t(R.string.sc_cancelled)
             return false
         }
@@ -2236,8 +2368,9 @@ object SessionController {
     private fun promptSpecifierFailed(
         wifi: Iap2SenderSession.WifiConfiguration,
         shellReady: Boolean,
+        isCancelled: () -> Boolean = { connectCancelled },
     ) {
-        if (connectCancelled) return
+        if (isCancelled()) return
         val choice =
             askWifiJoinChoice(
                 DialogSpec(
@@ -2247,13 +2380,14 @@ object SessionController {
                     positive = t(R.string.sc_retry),
                     negative = t(R.string.sc_open_wifi_settings),
                 ),
+                isCancelled = isCancelled,
             )
-        if (connectCancelled) return
+        if (isCancelled()) return
         when (choice) {
             true -> {
                 when (val retry = joinCarWifi(wifi, shellReady)) {
                     is WifiCarPlayConnector.JoinResult.Joined -> Unit
-                    WifiCarPlayConnector.JoinResult.Unsupported -> legacyJoinCarWifi(wifi, shellReady)
+                    WifiCarPlayConnector.JoinResult.Unsupported -> legacyJoinCarWifi(wifi, shellReady, isCancelled)
                     WifiCarPlayConnector.JoinResult.Unavailable -> {
                         phaseHint = t(R.string.sc_join_failed_manual)
                         appendLog("WIFI: 重试仍未加入 \"${wifi.ssid}\"——请到系统 WLAN 手动连接")
@@ -2261,7 +2395,7 @@ object SessionController {
                 }
             }
 
-            false -> manualJoinCarWifi(wifi)
+            false -> manualJoinCarWifi(wifi, isCancelled)
 
             null -> {
                 phaseHint = t(R.string.sc_join_failed_retry)
@@ -2271,9 +2405,13 @@ object SessionController {
     }
 
     /** 手动兜底：密码进剪贴板 + 跳 WLAN 设置，轮询用户是否连上。 */
-    private fun manualJoinCarWifi(wifi: Iap2SenderSession.WifiConfiguration) {
+    private fun manualJoinCarWifi(
+        wifi: Iap2SenderSession.WifiConfiguration,
+        isCancelled: () -> Boolean = { connectCancelled },
+    ) {
         val connector = wifiConnector
         if (connector != null && connector.hasExistingWifi() && connector.currentWifiSsid() == null) {
+            val shown = currentNetworkToken()
             val useCurrent =
                 askWifiJoinChoice(
                     DialogSpec(
@@ -2283,9 +2421,16 @@ object SessionController {
                         positive = t(R.string.sc_use_current),
                         negative = t(R.string.sc_open_wifi_settings),
                     ),
+                    shownNetwork = shown,
+                    isCancelled = isCancelled,
                 )
-            if (connectCancelled || useCurrent == null) return
+            if (isCancelled() || useCurrent == null) return
             if (useCurrent) {
+                // 用户确认的是弹窗里那张网络：期间换网则不能把确认套到新网络上。
+                if (shown == null || !shown.matches(connector.currentWifiNetwork(), liveWifiSsid())) {
+                    appendLog("WIFI: 用户确认期间当前网络已变化——不绑定新的 current")
+                    return
+                }
                 // The user explicitly confirmed Same-LAN; do not require location access to read the SSID.
                 val network =
                     synchronized(wifiBindLock) {
@@ -2309,10 +2454,14 @@ object SessionController {
         )
         val manualDeadline = android.os.SystemClock.uptimeMillis() + WLAN_WAIT_TIMEOUT_MS
         while (android.os.SystemClock.uptimeMillis() < manualDeadline) {
-            if (connectCancelled) return
+            // 用调用方的判据（含交接所有权），而不是全局 connectCancelled：交接被
+            // 别的链路接手后全局标志可能仍为 false，旧任务继续跑会在一轮新交接里
+            // 绑定旧端点的热点并重注册 ctrl 广播。
+            if (isCancelled()) return
             Thread.sleep(5_000)
+            if (isCancelled()) return
             if (liveWifiSsid() == wifi.ssid) {
-                bindVerifiedCarWifi(wifi.ssid, "手动入网") { }
+                bindVerifiedCarWifi(wifi.ssid, "手动入网", isCancelled) { }
                 return
             }
         }
@@ -2328,6 +2477,7 @@ object SessionController {
     private fun legacyJoinCarWifi(
         wifi: Iap2SenderSession.WifiConfiguration,
         shellReady: Boolean,
+        isCancelled: () -> Boolean = { connectCancelled },
     ) {
         if (!shellReady) {
             phaseHint = t(R.string.sc_not_on_hotspot, wifi.ssid)
@@ -2340,10 +2490,10 @@ object SessionController {
         val current = liveWifiSsid()
         if (current == wifi.ssid) {
             appendLog("WIFI: 手机已在车机热点 \"$current\"——直接绑定")
-            bindVerifiedCarWifi(wifi.ssid, "旧安全类型入网") { }
+            bindVerifiedCarWifi(wifi.ssid, "旧安全类型入网", isCancelled) { }
             return
         }
-        if (connectCancelled) return
+        if (isCancelled()) return
         val choice =
             askWifiJoinChoice(
                 DialogSpec(
@@ -2353,10 +2503,11 @@ object SessionController {
                     positive = t(R.string.sc_join_continue),
                     negative = t(R.string.sc_open_wifi_settings),
                 ),
+                isCancelled = isCancelled,
             )
-        if (connectCancelled) return
+        if (isCancelled()) return
         if (choice == false) {
-            manualJoinCarWifi(wifi)
+            manualJoinCarWifi(wifi, isCancelled)
             return
         }
         if (choice == null) {
@@ -2369,7 +2520,7 @@ object SessionController {
             ">>> 手机当前 ${wifiForLog(current, "未连接")}（非车机热点）——" +
                 "经 Shizuku 自动切换到 \"${wifi.ssid}\"",
         )
-        if (connectCancelled) return
+        if (isCancelled()) return
         val result =
             Shell.exec(
                 WifiConnectCommand.build(wifi.ssid, wifi.passphrase, wifi.securityType),
@@ -2387,7 +2538,7 @@ object SessionController {
         appendLog("WIFI: connect-network 已发起（自动保存网络，等待切换…）")
         // 系统切换是异步的（断开当前网/扫描/关联/DHCP，2-10 秒）：轮询 SSID 确认。
         repeat(20) {
-            if (connectCancelled) {
+            if (isCancelled()) {
                 appendLog("WIFI: 自动加入已取消（用户断开）")
                 return
             }
@@ -2395,12 +2546,12 @@ object SessionController {
             if (ssid == null) {
                 // status 命令不可用（非 AOSP 系统）：不做无 SSID 校验的通配绑定，
                 // 只接受核验句柄或用户确认的当前网络。
-                bindVerifiedCarWifi(wifi.ssid, "旧安全类型入网") { }
+                bindVerifiedCarWifi(wifi.ssid, "旧安全类型入网", isCancelled) { }
                 return
             }
             if (ssid == wifi.ssid) {
                 appendLog("WIFI: 已切到车机热点 ${wifi.ssid}")
-                bindVerifiedCarWifi(wifi.ssid, "旧安全类型入网") { }
+                bindVerifiedCarWifi(wifi.ssid, "旧安全类型入网", isCancelled) { }
                 return
             }
             Thread.sleep(800)
@@ -2488,24 +2639,74 @@ object SessionController {
     /**
      * 弹窗询问用户（阻塞调用线程直到选择/关闭/90 秒超时）：
      * true=positive；false=negative；null=无人应答（调用方决定兜底）。
+     *
+     * 同一轮里相同问题只有在**同一张网络**上才复用答案：`shownNetwork` 是弹窗展示时
+     * 采样的网络快照，手机换网后不会复用它，也不会并入正为旧网络展示的弹窗
+     * （见 [WifiPromptBroker]）。`null` = 调用方没有网络快照，此问题不合并。
+     *
+     * 取消或轮次变化时立即返回 null，并且不再为新网络补弹旧轮次的框。
+     *
+     * [isCancelled] 必须是本轮的有效性判定（通常含 [connectCancelled] 与交接所有权）：
+     * 车机拆链后等待要立刻退出。broker 只负责停止等待，**不会**关掉已显示的
+     * AlertDialog，因此提前退出时还要按 requestId 撤框，否则用户会看到一个点了也
+     * 没用的框（见 [dialogDismissSink]）。
      */
-    private fun askWifiJoinChoice(spec: DialogSpec): Boolean? {
-        val latch = java.util.concurrent.CountDownLatch(1)
-        var choice: Boolean? = null
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            val sink = dialogSink
-            if (sink == null) {
-                // 无 UI 宿主（Activity 销毁窗口）：宁可中止也不默认替用户决定加入
-                latch.countDown()
-                return@post
-            }
-            sink(spec) { result ->
-                choice = result
-                latch.countDown()
+    private fun askWifiJoinChoice(
+        spec: DialogSpec,
+        shownNetwork: WifiNetworkToken<Network>? = null,
+        isCancelled: () -> Boolean = { connectCancelled },
+    ): Boolean? {
+        val round = wifiPromptBroker.currentGeneration()
+
+        fun expired(): Boolean = isCancelled() || wifiPromptBroker.currentGeneration() != round
+        // 旧请求可能正为另一张网络展示：等它收尾后重新提问，而不是把不匹配的答案
+        // 当成用户拒绝（那会让一次本可完成的交接直接失败）。
+        repeat(CONFIRM_CURRENT_MAX_ATTEMPTS) {
+            if (expired()) return null
+            when (val claim = wifiPromptBroker.claim(spec, shownNetwork)) {
+                is WifiPromptBroker.Claim.Answered -> return claim.answer
+
+                is WifiPromptBroker.Claim.Follower -> {
+                    val answer = wifiPromptBroker.await(claim.future, JOIN_DIALOG_TIMEOUT_S * 1_000, ::expired)
+                    // null 不代表本请求过期：用户可能只是关掉了为**另一张网络**展示的框。
+                    // 只有本请求真的被取消/跨轮才放弃；否则为当前网络重新提问。
+                    if (claim.matches) return answer
+                    if (expired()) return null
+                    return@repeat
+                }
+
+                is WifiPromptBroker.Claim.Owner -> {
+                    // 本次询问的标识：提前退出时按它撤掉对应的那个弹窗。
+                    val requestId = dialogRequestIds.incrementAndGet()
+                    val request = spec.copy(requestId = requestId)
+                    val answered =
+                        java.util.concurrent.atomic
+                            .AtomicBoolean(false)
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        val sink = dialogSink
+                        if (sink == null) {
+                            // 无 UI 宿主（Activity 销毁窗口）：宁可中止也不默认替用户决定加入
+                            wifiPromptBroker.finish(claim, null, cache = false)
+                            return@post
+                        }
+                        sink(request) { result ->
+                            answered.set(true)
+                            wifiPromptBroker.finish(claim, result, cache = true)
+                        }
+                    }
+                    try {
+                        val answer = wifiPromptBroker.await(claim.future, JOIN_DIALOG_TIMEOUT_S * 1_000, ::expired)
+                        if (!claim.future.isDone) wifiPromptBroker.timeout(claim)
+                        return answer
+                    } finally {
+                        // 提前退出（取消/跨轮/超时）时撤掉仍显示的弹窗；已应答时是无害 no-op
+                        // （UI 侧按 requestId 只关对应那一个）。
+                        if (!answered.get()) runCatching { dialogDismissSink?.invoke(requestId) }
+                    }
+                }
             }
         }
-        latch.await(JOIN_DIALOG_TIMEOUT_S, java.util.concurrent.TimeUnit.SECONDS)
-        return choice
+        return null
     }
 
     private fun openWlanSettings() {
@@ -2569,6 +2770,29 @@ object SessionController {
     private fun liveWifiMatches(ssid: String): Boolean? {
         val live = liveWifiSsid() ?: return null
         return WifiIdentity.matches(ssid, live)
+    }
+
+    /**
+     * 目标 SSID 对应的、可安全绑定的 `Network` 句柄。
+     *
+     * 有定位权限时优先用 [WifiCarPlayConnector.verifiedWifiNetwork]（同一回调里核验句柄与 SSID）。
+     * Android 13+ 本应用只申请 `NEARBY_WIFI_DEVICES`，没有定位权限时该方法恒为 null——
+     * 此时若 Shizuku 读到的站端 SSID 与目标一致、且系统只有这一张 Wi-Fi，
+     * 唯一性已经成立，不必再弹「使用当前 Wi-Fi？」。句柄与 SSID 是两次系统查询，
+     * 必须连续两次采样都成立且句柄相同才采信（见 [VerifiedWifiSelection.confirmed]），
+     * 否则手机恰在两次查询之间换网就会把 A 的句柄贴成 B。两张及以上并存或采样不一致时
+     * 仍返回 null，交给用户确认，绝不猜网络。
+     */
+    private fun verifiedWifiNetworkFor(ssid: String): Network? {
+        val connector = wifiConnector ?: return null
+        connector.verifiedWifiNetwork(ssid)?.let { return it }
+
+        fun sample() =
+            VerifiedWifiSelection.Sample(
+                network = connector.singleWifiNetwork(),
+                ssid = liveWifiSsid(),
+            )
+        return VerifiedWifiSelection.confirmed(ssid, sample(), sample())
     }
 
     private fun shellWifiDisabled(): Boolean = !shellWifiStatus().first
@@ -2964,6 +3188,14 @@ object SessionController {
     }
 
     /** 界面提示文案（阶段提示、Snackbar、确认弹窗；随界面语言）。日志仍写中文。 */
+
+    /**
+     * 当前网络的快照：Network 句柄 + 可读 SSID。弹窗答案只能在**同一张网络**上复用
+     * （见 [WifiPromptBroker]）；两者都读不到时返回 null——此时不合并、不缓存答案。
+     */
+    private fun currentNetworkToken(): WifiNetworkToken<Network>? =
+        WifiNetworkToken(wifiConnector?.currentWifiNetwork(), liveWifiSsid()).takeIf { it.hasIdentity }
+
     private fun t(
         @StringRes id: Int,
         vararg args: Any,
@@ -3295,6 +3527,8 @@ object SessionController {
                             positive = if (ssid == null) t(R.string.sc_use_current) else t(R.string.sc_continue_as_hotspot),
                             negative = t(R.string.sc_keep_waiting),
                         ),
+                        // 同一张网络只问一次；答案也只能在这张网络上复用。
+                        shownNetwork = WifiNetworkToken(network, ssid),
                     )
                 if (choice == true && !connectCancelled && !sessionStarting.get() && stillPending()) {
                     if (wifiConnector?.currentWifiNetwork() != network) {
@@ -5126,7 +5360,7 @@ object SessionController {
                         }
 
                         WifiCarPlayConnector.JoinResult.Unavailable -> {
-                            promptSpecifierFailed(wifi, shellReady)
+                            promptSpecifierFailed(wifi, shellReady, isCancelled)
                             settled = true
                             val bound = boundCarSsid == wifi.ssid && wifiConnector?.currentNetwork != null
                             onResult(bound)
@@ -5167,7 +5401,7 @@ object SessionController {
             }
             val verifiedNetwork =
                 when {
-                    requireLiveMatch -> wifiConnector?.verifiedWifiNetwork(ssid)
+                    requireLiveMatch -> verifiedWifiNetworkFor(ssid)
                     networkToBind != null -> networkToBind
                     requireInvite -> verifiedInviteNetwork(pendingEndpoint.observation)
                     else -> wifiConnector?.currentWifiNetwork()
@@ -5221,8 +5455,9 @@ object SessionController {
             val label = knownSsid ?: INVITED_WIFI_LABEL
             // 弹窗展示的是「此刻」的网络：先保存 Network 句柄与可读 SSID 作为令牌。
             // 用户可能在弹窗期间切到另一张 Wi-Fi，返回后必须仍是同一网络，否则会把
-            // A 的确认套到 B 上（以 A 的 SSID 绑定 B 并重注册 ctrl）。
-            val shown = WifiNetworkToken(wifiConnector?.currentWifiNetwork(), liveWifiSsid())
+            // A 的确认套到 B 上（以 A 的 SSID 绑定 B 并重注册 ctrl）。令牌同时是
+            // 弹窗复用/去重的键：换网后既不复用旧答案，也不并入为旧网络展示的弹窗。
+            val shown = currentNetworkToken()
             val choice =
                 askWifiJoinChoice(
                     DialogSpec(
@@ -5231,6 +5466,8 @@ object SessionController {
                         positive = t(R.string.sc_use_current),
                         negative = t(R.string.sc_open_wifi_settings),
                     ),
+                    shownNetwork = shown,
+                    isCancelled = isCancelled,
                 )
             if (isCancelled()) {
                 onResult(false)
@@ -5240,7 +5477,8 @@ object SessionController {
                 true -> {
                     val current = wifiConnector?.currentWifiNetwork()
                     val currentSsid = liveWifiSsid()
-                    if (!shown.matches(current, currentSsid)) {
+                    // 无令牌时没有可比对的身份：不能把这次确认套到任意 current 上。
+                    if (shown == null || !shown.matches(current, currentSsid)) {
                         appendLog(
                             "WIFI: [$source] 用户确认期间当前网络已变化——重新提示" +
                                 "（不把这次确认套到新的 current 上）",
@@ -5299,6 +5537,7 @@ object SessionController {
                     positive = t(R.string.sc_open_wifi_settings),
                     negative = t(R.string.sc_keep_waiting),
                 ),
+                isCancelled = isCancelled,
             )
         if (isCancelled()) {
             onResult(false)
@@ -5348,12 +5587,13 @@ object SessionController {
             }
             val live = liveWifiSsid()
             if (ssid != null && WifiIdentity.matches(ssid, live)) {
-                val network = wifiConnector?.verifiedWifiNetwork(ssid)
+                val network = verifiedWifiNetworkFor(ssid)
                 if (network == null) {
                     // Shizuku 只能读到 SSID、拿不到带定位信息的 Network 句柄时，
                     // 不用通配请求替用户猜网络；给一次明确的“使用当前网络”确认。
                     if (!askedForShellOnlyConfirmation) {
                         askedForShellOnlyConfirmation = true
+                        val shown = currentNetworkToken()
                         val confirmed =
                             askWifiJoinChoice(
                                 DialogSpec(
@@ -5362,6 +5602,8 @@ object SessionController {
                                     positive = t(R.string.sc_use_current),
                                     negative = t(R.string.sc_keep_waiting),
                                 ),
+                                shownNetwork = shown,
+                                isCancelled = isCancelled,
                             )
                         if (isCancelled()) {
                             onResult(false)
@@ -5369,7 +5611,8 @@ object SessionController {
                         }
                         if (confirmed == true) {
                             val confirmedNetwork = wifiConnector?.currentWifiNetwork()
-                            onResult(confirmedNetwork != null && bindCarWifiAndRegister(ssid, confirmedNetwork, isCancelled))
+                            val stillShown = shown != null && shown.matches(confirmedNetwork, liveWifiSsid())
+                            onResult(stillShown && confirmedNetwork != null && bindCarWifiAndRegister(ssid, confirmedNetwork, isCancelled))
                             return
                         }
                         if (confirmed == null) {
@@ -5388,6 +5631,7 @@ object SessionController {
                 SystemClock.uptimeMillis() - startedAt >= 8_000L
             ) {
                 askedForConfirmation = true
+                val shown = currentNetworkToken()
                 val confirmed =
                     askWifiJoinChoice(
                         DialogSpec(
@@ -5396,6 +5640,8 @@ object SessionController {
                             positive = t(R.string.sc_use_current),
                             negative = t(R.string.sc_keep_waiting),
                         ),
+                        shownNetwork = shown,
+                        isCancelled = isCancelled,
                     )
                 if (isCancelled()) {
                     onResult(false)
@@ -5403,8 +5649,10 @@ object SessionController {
                 }
                 if (confirmed == true) {
                     val confirmedNetwork = wifiConnector?.currentWifiNetwork()
+                    val stillShown = shown != null && shown.matches(confirmedNetwork, liveWifiSsid())
                     onResult(
-                        confirmedNetwork != null &&
+                        stillShown &&
+                            confirmedNetwork != null &&
                             bindCarWifiAndRegister(ssid ?: live ?: INVITED_WIFI_LABEL, confirmedNetwork, isCancelled),
                     )
                     return
@@ -5446,7 +5694,7 @@ object SessionController {
         while (android.os.SystemClock.uptimeMillis() < deadline && !isCancelled()) {
             val current = liveWifiSsid()
             if (current == wifi.ssid) {
-                val network = wifiConnector?.verifiedWifiNetwork(wifi.ssid)
+                val network = verifiedWifiNetworkFor(wifi.ssid)
                 if (network == null) {
                     appendLog("WIFI: 已连在目标热点但拿不到对应 Network 句柄——请求用户确认")
                     confirmCurrentWifiThenContinue(wifi.ssid, "手动入网", null, isCancelled, onBound)
@@ -5586,6 +5834,26 @@ internal fun usableKnownCarSsid(
 ): String? =
     listOf(bound, last)
         .firstOrNull { !it.isNullOrBlank() && it != SessionController.INVITED_WIFI_LABEL }
+
+/**
+ * 端点交付前失败时，是否应结束当前时间线并计入自动重连熔断。
+ *
+ * 只收尾仍能继续的轮次：已失败/已结束的轮次不再覆盖记录；已经推进到 DISCOVERY
+ * 及以后的轮次说明端点早已交付（那属于 `onLinkClosed` 的语义），这里不重复处理。
+ * [waitingForLateEndpoint] 为 true 表示本轮已收到**空端点**、正在有意等待晚到的
+ * 0x4301——它同样停在 waiting+BLUETOOTH，但必须由 `watchForPendingStartSession`
+ * 自己收尾，不能当成失败。抽成纯函数是为了单测覆盖（bug #66）。
+ */
+internal fun settlesOnPreEndpointFailure(
+    status: String,
+    stage: ConnectionStage,
+    waitingForLateEndpoint: Boolean = false,
+    anotherLinkLive: Boolean = false,
+): Boolean =
+    status == "waiting" &&
+        stage == ConnectionStage.BLUETOOTH &&
+        !waitingForLateEndpoint &&
+        !anotherLinkLive
 
 /**
  * 链路关闭是否应进入自动重连熔断记账。
