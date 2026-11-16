@@ -224,7 +224,37 @@ class VideoSender(
     /** 主屏拿回后，下一个 CarWith IDR 前重发 VideoConfig 并内联 SPS/PPS（见 [reprimeOnNextKeyFrame]）。 */
     private val reprimePending = AtomicBoolean(false)
     private val encoderReprimePending = AtomicBoolean(false)
-    private val externalQueue = java.util.concurrent.LinkedBlockingQueue<ExternalVideoFrame>(64)
+
+    /**
+     * 透传队列（容量 8，见 [PassthroughFrameQueue]）。入队方是 CarLife 读线程，出队方是推流线程；
+     * 本字段只做内存排队，不做任何阻塞式网络调用。
+     *
+     * 丢帧后的「解码链已断」标记随帧入队（[PassthroughFrameQueue.Entry.discontinuityBefore]），
+     * 不单独保存：否则入队唤醒推流线程与打标记之间存在窗口，新 IDR 可能先被消费、
+     * 再被迟到的标记多等一个 IDR（2026-11-16 审查）。
+     */
+    private val externalQueue = PassthroughFrameQueue()
+
+    /** 队满换入新 IDR 的累计次数（日志限流用，避免每秒刷屏）。 */
+    private val queueReplacements =
+        java.util.concurrent.atomic
+            .AtomicLong()
+
+    /** 队满后向 CarWith 补要关键帧：限流 + 后台线程，避免阻塞 CarLife 读线程。 */
+    private val overflowKeyFrameRecovery =
+        OverflowKeyFrameRecovery(
+            request = {
+                // 会话已停止/在拆：后台线程不得再向 CarWith 发命令。
+                if (stopped.get() || quiescing.get() || !running.get()) {
+                    false
+                } else {
+                    requestKeyFrame(fromReceiver = false)
+                }
+            },
+            // 与屏幕门控/统计共用同一个单调时钟（SystemClock.uptimeMillis）。
+            nowMillis = uptimeMs,
+            log = log,
+        )
 
     @Volatile
     private var framesSent = 0L
@@ -263,6 +293,17 @@ class VideoSender(
 
     /** 健康线程是否仍在运行（会话停止后必须结束）；测试用。 */
     internal fun isHealthMonitorAlive(): Boolean = healthMonitorRunning.get()
+
+    /** 队满补要关键帧的派发线程是否仍在运行；测试用。 */
+    internal fun isOverflowRecoveryAlive(): Boolean = overflowKeyFrameRecovery.isWorkerAlive
+
+    /**
+     * 队列里是否还有带断流标记的帧（测试与诊断用）。
+     *
+     * 标记与帧一起入队、随帧一起取出，所以这里读到 true 就表示「消费方还没拿到那个恢复点」。
+     */
+    internal val isPassthroughResyncPending: Boolean
+        get() = externalQueue.hasPendingDiscontinuity()
 
     /** 转码路径：门控已确认暂停时不再解码/编码；读取失败按暂停处理，与 [admitScreenFrame] 一致。 */
     private fun screenFeedPaused(): Boolean {
@@ -589,7 +630,9 @@ class VideoSender(
                     lastKeepAliveAt = android.os.SystemClock.uptimeMillis()
                     lastVideoWriteAtMs = healthClockMs()
                 }
+                // 两条独立的守护线程：#75 的输出停滞看门狗与 #76 的队满补要关键帧。
                 startHealthMonitor()
+                overflowKeyFrameRecovery.start()
                 Thread({ drainExternalVideo() }, "video-external-drain").apply {
                     isDaemon = true
                     start()
@@ -651,21 +694,85 @@ class VideoSender(
          */
         baselineProfile: Boolean = false,
     ): Pair<MediaCodec, Surface> {
-        val bitrate =
-            (
-                ((encodeWidth * encodeHeight * 6L).toInt()).coerceIn(2_000_000, 10_000_000) *
-                    if (fps >= 60) 1.5f else 1f
-            ).toInt().coerceAtMost(15_000_000)
+        val bitrate = EncoderFormatRules.bitrateFor(encodeWidth, encodeHeight, fps)
         log("VIDEO: 启动编码器 ${encodeWidth}x$encodeHeight@$fps ${bitrate / 1_000_000}Mbps（端口已连通）")
+        if (baselineProfile) {
+            log("VIDEO: 转码编码器键 ${EncoderFormatPolicy.describe(fps)}")
+        }
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        // 只读核对「实际创建的这个编码器」声明了什么：候选尺寸/帧率/profile/level 是否在能力表内。
+        // 只记录、不阻断——厂商能力表常低估，据此提前失败会让原本能 configure 成功的设备黑屏；
+        // 也不能按对齐取整或换 codec，那会改动已协商、并写进 VideoConfig 头部让车机建画布的尺寸。
+        logEncoderCapability(codec, encodeWidth, encodeHeight, fps, baselineProfile)
+        // configure / createInputSurface / start 任一失败都要释放全部已创建资源：原实现只在 start 之后
+        // 由调用方收尾，此处提前失败会泄漏一个编码器实例（转码路径重试时尤为明显）；
+        // Surface 同理——start 抛异常时它尚未返回给调用方，只能在这里释放。
+        var surface: Surface? = null
+        return releaseOnFailure(
+            {
+                surface?.let { runCatching { it.release() } }
+                runCatching { codec.release() }
+            },
+        ) {
+            // 逐级回退：每一级只在上一级被编码器拒绝时才尝试，且必须先 reset() 才能重新 configure。
+            // 级数与「这一级撤销了什么」由 EncoderFormatPolicy.attempts 决定并有单测；
+            // 转码专用键不随 level/Profile 撤销。
+            val attempts =
+                EncoderFormatPolicy.attempts(baselineProfile).map { attempt ->
+                    format(encodeWidth, encodeHeight, fps, bitrate, capEncoderFps, baselineProfile, attempt) to
+                        attempt.dropped
+                }
+            var lastRejection: Exception? = null
+            for ((index, attempt) in attempts.withIndex()) {
+                if (index > 0) runCatching { codec.reset() }
+                try {
+                    codec.configure(attempt.first, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    attempt.second?.let { dropped ->
+                        if (dropped.startsWith("priority")) {
+                            log("VIDEO: 编码器拒绝 $dropped（${lastRejection?.message}）——去掉后重试，其余参数不变")
+                        } else {
+                            log("VIDEO: 指定 $dropped 被编码器拒绝（${lastRejection?.message}）——回退自动选择（部分车机可能黑屏）")
+                        }
+                    }
+                    lastRejection = null
+                    break
+                } catch (rejected: Exception) {
+                    lastRejection = rejected
+                }
+            }
+            // 全部候选都被拒绝：清理后原样抛出（清理已由 releaseOnFailure 统一负责）
+            lastRejection?.let { throw it }
+            val created = codec.createInputSurface()
+            surface = created
+            codec.start()
+            codec to created
+        }
+    }
 
-        val format =
-            MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodeWidth, encodeHeight).apply {
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                if (capEncoderFps) setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
-                if (baselineProfile) setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+    private fun format(
+        encodeWidth: Int,
+        encodeHeight: Int,
+        fps: Int,
+        bitrate: Int,
+        capEncoderFps: Boolean,
+        baselineProfile: Boolean,
+        attempt: EncoderFormatPolicy.Attempt,
+    ): MediaFormat =
+        MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodeWidth, encodeHeight).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            if (capEncoderFps) setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
+            if (baselineProfile) {
+                // 转码路径：禁 B 帧 + 无新帧时按帧间隔重复上一帧（单位微秒，见 EncoderFormatPolicy）。
+                // 即使下面这一级撤销了 level/Profile，这两个键也必须保留。
+                EncoderFormatPolicy.transcodeKeys(fps).applyTo(this)
+            }
+            if (attempt.withLevelAndProfile) {
+                if (baselineProfile) {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                }
                 // 固定 H.264 level 4.0（SPS level_idc=40，真 iPhone 同款流形态）。
                 // 不固定时编码器按「分辨率+帧率」自动选：默认 30fps 下 1412x654
                 // 合法落入 level 3.2——奥迪 DELPHI 解码器对该 level 静默不渲染
@@ -679,25 +786,35 @@ class VideoSender(
                     )
                 }
             }
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        // 个别编码器不接受 level 指定（configure 抛异常=视频全灭），降级为不指定重试
-        try {
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        } catch (levelRejected: Exception) {
-            log("VIDEO: 指定 level 4.0${if (baselineProfile) " / Baseline" else ""} 被编码器拒绝（${levelRejected.message}）——回退自动选择（部分车机可能黑屏）")
-            val fallback =
-                MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encodeWidth, encodeHeight).apply {
-                    setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                    setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                    setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                    if (capEncoderFps) setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
-                }
-            codec.configure(fallback, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            if (attempt.withOptionalRealtime) EncoderFormatPolicy.applyOptionalRealtime(this)
         }
-        val surface = codec.createInputSurface()
-        codec.start()
-        return codec to surface
+
+    /**
+     * 「候选 → 选中 → 依据」一行日志。能力读取失败时如实记未知，不当作不支持。
+     *
+     * 新增短语不匹配 `tools/logbot/rules.py` 的任何 `LogPattern`，无需三处同改；
+     * 也刻意不复用 `VIDEO: 启动编码器` 等既有行，避免改变既有日志的解析口径。
+     */
+    private fun logEncoderCapability(
+        codec: MediaCodec,
+        encodeWidth: Int,
+        encodeHeight: Int,
+        fps: Int,
+        baselineProfile: Boolean,
+    ) {
+        val check =
+            EncoderCapabilityRules.assess(
+                capability = readEncoderCapability(codec, encodeWidth, encodeHeight, fps),
+                width = encodeWidth,
+                height = encodeHeight,
+                fps = fps,
+                baselineProfile = baselineProfile,
+                level4 = true,
+            )
+        log("VIDEO: 编码能力核对 ${check.summary}")
+        if (check.problems.isNotEmpty()) {
+            log("VIDEO: 编码能力核对差异 - ${check.problems.joinToString("；")}（仍按原参数 configure）")
+        }
     }
 
     /**
@@ -732,6 +849,10 @@ class VideoSender(
         val healthSummary = finalizeOutputHealth()
         stopped.set(true)
         running.set(false)
+        // 先停补要线程：否则它可能在会话结束后仍向 CarWith 发命令。
+        // 不 join（守护线程、请求本身可能阻塞在命令通道），断开按钮不被它拖住。
+        overflowKeyFrameRecovery.stop()
+        // clear() 同时清掉队列里带断流标记的帧与尚未附着的标记。
         externalQueue.clear()
         val monitor = healthThread
         healthThread = null
@@ -762,6 +883,7 @@ class VideoSender(
     /** 不等待写锁或关闭 socket：阻塞中的写仍可由随后的 stop() 解开。 */
     fun quiesceForOrderlyStop() {
         quiescing.set(true)
+        overflowKeyFrameRecovery.stop()
         externalQueue.clear()
     }
 
@@ -941,20 +1063,59 @@ class VideoSender(
      *
      * Returns false when the bounded queue is full; callers should drop the
      * packet rather than block CarLife's video reader.
+     *
+     * 容量 8（[PassthroughFrameQueue]）。队满时：
+     *  - 普通帧丢弃并返回 false（调用方重置入流门控等下一个 IDR），并额外派发一次补要关键帧；
+     *  - 关键帧替换已排队的旧帧后仍然入队（返回 true），因为它是唯一可用的恢复边界——
+     *    不能让它被丢弃，也不能把更早的旧关键帧当成恢复点；此时恢复点已到，不再补要。
+     * 丢帧后的断流标记随入队的帧一起交给推流线程，不在这里单独置位（见 [externalQueue]）。
+     * 两条路径都只做内存操作，本线程（CarLife 读线程）不做任何网络调用。
      */
     fun submitExternalFrame(frame: ExternalVideoFrame): Boolean =
         if (externalVideoSource == null || !running.get() || quiescing.get()) {
             false
         } else {
-            externalQueue.offer(frame).also { accepted ->
-                if (!accepted) {
+            val offer = externalQueue.offer(frame)
+            when (offer.outcome) {
+                PassthroughFrameQueue.Outcome.ACCEPTED -> true
+
+                PassthroughFrameQueue.Outcome.REPLACED_STALE -> {
+                    val replacements = queueReplacements.incrementAndGet()
+                    if (replacements <= 3 || replacements % 50 == 0L) {
+                        log(
+                            "VIDEO: 透传队列已满（深度 ${offer.depth}/${PassthroughFrameQueue.DEFAULT_CAPACITY}），" +
+                                "丢弃已排队旧帧 ${offer.evicted} 帧以换入新 IDR（旧 IDR 不再作为恢复点），" +
+                                "累计 $replacements 次",
+                        )
+                    }
+                    // 恢复点已经到达，不再补要关键帧：否则会白白消耗限流窗口，
+                    // 让紧接着真正需要的那次补要（DROPPED_FULL）被压住。
+                    true
+                }
+
+                PassthroughFrameQueue.Outcome.DROPPED_FULL -> {
+                    // 转码路径由推流线程在下一次投喂前看到随帧携带的断流标记；透传路径的恢复
+                    // 由调用方 reset 入流门控完成，标记只是随下一帧一起被丢弃。
                     val drops = streamStats.onQueueDrop()
                     if (drops <= 3 || drops % 50 == 0L) {
-                        log("VIDEO: 透传队列已满（${externalQueue.size} 帧），丢弃 CarWith 帧，累计 $drops 次（随后等下一个 IDR）")
+                        // 最近一次写入耗时用于区分「车机/链路慢」与「本机解码/编码慢」：
+                        // 写得很慢却仍队满 → 数据口拥塞；写很快却排不上 → 本机管线跟不上。
+                        log(
+                            "VIDEO: 透传队列已满（深度 ${offer.depth}/${PassthroughFrameQueue.DEFAULT_CAPACITY}），" +
+                                "丢弃 CarWith 帧（关键帧=${frame.keyFrame}，路径=${if (transcoder == null) "透传" else "转码"}，" +
+                                "最近写入=${streamStats.lastWriteMillis()}ms），累计 $drops 次（随后等下一个 IDR）",
+                        )
                     }
+                    requestOverflowKeyFrame()
+                    false
                 }
             }
         }
+
+    /** 队满后的补要关键帧：限流在 [OverflowKeyFrameRecovery] 内，真正的请求走它的后台线程。 */
+    private fun requestOverflowKeyFrame() {
+        overflowKeyFrameRecovery.signal()
+    }
 
     /** Align the CarPlay canvas to the SPS dimensions from CarWith. */
     fun setVideoDimensions(
@@ -1038,26 +1199,33 @@ class VideoSender(
         val output = socket?.getOutputStream() ?: return
         try {
             while (running.get()) {
-                val frame = externalQueue.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS)
+                val entry = externalQueue.poll(250)
                 // 转码中：帧改喂解码器，数据口（含 keepAlive）由编码线程独占
                 val pipeline = transcoder
                 if (quiescing.get()) continue
                 if (pipeline != null) {
-                    if (frame != null) markSourceInput()
+                    if (entry != null) markSourceInput()
+                    // 断流标记随帧到达（入队时原子写入）：先标记，再喂这一帧。新 IDR 因此
+                    // 一定会经过「等 IDR」逻辑，而不会先被当成正常帧喂进去再被迟到的标记
+                    // 逼着多等一个 IDR（2026-11-16 审查）。
+                    if (entry != null && entry.discontinuityBefore) pipeline.notifyDiscontinuity()
                     // 门控已确认暂停后停止喂帧：解码/编码一场倒车影像的输入是纯功耗；
                     // 恢复时继续喂帧，由编码线程等新的 IDR 再放行输出。
-                    if (frame != null && !screenFeedPaused()) pipeline.submit(frame)
+                    if (entry != null && !screenFeedPaused()) pipeline.submit(entry.frame)
                     continue
                 }
-                if (frame == null) {
+                if (entry == null) {
                     // 透传线程是本路径唯一的 drain：在这里消费看门狗的补帧请求
                     consumeHealthKeyFrameRequest()
                     maybeSendKeepAlive(output)
                     continue
                 }
+                val frame = entry.frame
                 var nalUnits = splitAnnexB(frame.data)
                 if (nalUnits.isEmpty()) continue
                 markSourceInput()
+                // 透传路径不消费断流标记：它已经随这一帧取出并就此消失，不会残留到
+                // 之后的转码切换（透传丢帧的恢复由调用方 reset 入流门控完成）。
                 if (!admitScreenFrame(frame.keyFrame, passthrough = true)) {
                     maybeSendKeepAlive(output)
                     continue
@@ -1087,7 +1255,7 @@ class VideoSender(
                 val writeStart = android.os.SystemClock.uptimeMillis()
                 if (!sendPlainFrame(packed, frame.keyFrame, output)) continue
                 val now = android.os.SystemClock.uptimeMillis()
-                streamStats.onFrameSent(nalUnits, frame.keyFrame, now, packed.size, now - writeStart, externalQueue.size)
+                streamStats.onFrameSent(nalUnits, frame.keyFrame, now, packed.size, now - writeStart, externalQueue.depth)
                 if (framesSent == STREAM_STATS_EARLY_FRAMES) {
                     lastStreamStatsLogAt = now
                     log("VIDEO: 透传码流统计（前 $framesSent 帧）${streamStats.summary()}")
@@ -1426,11 +1594,15 @@ class VideoSender(
             // 写入开始前取快照：写入期间或之后到达的源输入/编码器输出都会大于它
             val sourceSeqBeforeWrite = sourceInputSeq.get()
             val encoderSeqBeforeWrite = encoderOutputSeq.get()
+            val writeStart = android.os.SystemClock.uptimeMillis()
+            // trackedWrite 让健康线程知道「有写在途」，据此把停滞判成写阻塞而不是编码器故障；
+            // 写耗时同时喂给队满诊断（#76），两条路径共用这一个测量点。
             trackedWrite {
                 output.write(header)
                 output.write(sealed)
                 output.flush()
             }
+            streamStats.onFrameWrite(android.os.SystemClock.uptimeMillis() - writeStart)
             markVideoWriteSucceeded(sourceSeqBeforeWrite, encoderSeqBeforeWrite)
             framesSent++
             framesSinceKeepAlive++
