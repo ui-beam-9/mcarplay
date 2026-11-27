@@ -17,7 +17,10 @@ import com.mcarplay.app.bt.AutoConnectPrefs
 import com.mcarplay.app.bt.AutoReconnectGuard
 import com.mcarplay.app.bt.TargetDevicePrefs
 import com.mcarplay.app.carlife.CarLifeDiagnostics
+import com.mcarplay.app.carlife.CarLifeDiagnosticsHost
 import com.mcarplay.app.carlife.CarLifeLauncher
+import com.mcarplay.app.carlife.CarLifeSession
+import com.mcarplay.app.carlife.CarLifeSessionRegistry
 import com.mcarplay.app.compat.ReceiverCompatibility
 import com.mcarplay.app.diagnostics.DiagnosticCode
 import com.mcarplay.app.i18n.AppLanguage
@@ -72,7 +75,13 @@ class CarPlayService : Service() {
             if (SessionController.bluetoothDisconnectAction() == ReceiverCompatibility.BluetoothLossAction.KEEP_NETWORK_SESSION) {
                 val frames = SessionController.videoSender?.framesSentTotal ?: 0
                 Bg.run("bt-handoff-log") {
-                    SessionController.appendLog("AUTO: 蓝牙已断开，兼容策略保留已接入的网络会话（已发送 $frames 帧）")
+                    SessionController.appendLog(
+                        if (SessionController.currentClient?.setupHandoffStarted == true) {
+                            ">>> AUTO: GS3 蓝牙已交接给 AirPlay TCP——保留网络会话，继续等待 RECORD"
+                        } else {
+                            "AUTO: 蓝牙已断开，兼容策略保留已接入的网络会话（已发送 $frames 帧）"
+                        },
+                    )
                 }
                 return START_STICKY
             }
@@ -179,7 +188,7 @@ class CarPlayService : Service() {
             }
         } else if (intent?.action == ACTION_START_DIAGNOSTIC) {
             fileLog("SVC: 收到「启动 CarWith 自检」")
-            if (!CarLifeDiagnostics.start(applicationContext) && !SessionController.isSessionRunning()) {
+            if (!CarLifeDiagnostics.start(applicationContext, carLifeDiagnosticsHost) && !SessionController.isSessionRunning()) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
@@ -316,6 +325,20 @@ class CarPlayService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, CarPlayService::class.java))
         }
+
+        private val carLifeDiagnosticsHost =
+            object : CarLifeDiagnosticsHost {
+                override fun isFormalActive(): Boolean = SessionController.isFormalCarLifeActive()
+
+                override fun claimDiagnostic(session: CarLifeSession): Boolean =
+                    SessionController.claimCarLifeSession(CarLifeSessionRegistry.Owner.DIAGNOSTIC, session)
+
+                override fun release(session: CarLifeSession): Boolean = SessionController.releaseCarLifeSession(session)
+
+                override fun onSelfTestEnded(appContext: Context) = stopDiagnostic(appContext)
+
+                override fun log(message: String) = SessionController.appendLog(message)
+            }
 
         fun startDiagnostic(context: Context) {
             context.startForegroundService(

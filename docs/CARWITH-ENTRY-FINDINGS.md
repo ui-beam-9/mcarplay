@@ -1,5 +1,132 @@
 # CarWith 公开入口调查（2026-10-25）
 
+## 2026-11-26–27 Phase 3b（`dev` @ `9ac1b4c`）对照 `main`（`df4c81d`）T2 实车与台架验收
+
+- **测试环境：** 手机 Xiaomi `2509FPN0BC` / Android `17` / HyperOS `V816`；CarWith `4.0.23-20261016`，小米 CarLife `8.8.5 (274)`。对比构建均使用同签名本机 debug 包：`main` @ `df4c81d`（`apkSha256=b3479555…`）与 `dev` @ `9ac1b4c`（`apkSha256=2b57844b…`，含 Phase 2/3a/3b 重构及 `#127` CarWith 尺寸协商）。离线门禁：`spotlessCheck`、`lintStandardDebug`、`assembleStandardDebug` 及 standard 1,859 项 / remote bridge 25 项 / Python 87 项 / Node 20 项单测均全通过。16 份 `dev` 脱敏报告（均保留在仓库外 `~/mcarplay-regression/2026-11-26-*/`）中 `SESSION: SCOPE_MISMATCH` 均为 **0 条**。
+- **奇瑞艾瑞泽 8 实车（`CHERY / Tiggo / 320.17.7`，车机回连手机 iAP2）：**
+  - `main` 与 `dev` 均跑通 S1–S6，命中 `chery.tiggo.320.17.7.single-record`，`VIDEO_INIT_DONE 1920x720@30`、实际 SPS `1920x720`。
+  - **S1（冷启动带声音 + 断链观察）：** `main` 首帧 ~12.6 s / 首音频 ~33.6 s（`5991` 帧 / `4456` 音频包）；`dev` 首帧 ~16.3 s / 首音频 ~19.7 s（`6346` 帧 / `5623` 音频包）。两轮手动断开后静置观察车机 **≥ 60 s 均未崩溃**；`compare_diagnostics.py` 对比时间线 `tl_fails=0`。
+  - **S2（断开立即重连）：** 两版本现象一致——手机主动出站 `90ms READ_FAILED` 被拒，手动断开后需在车机端断开并重连蓝牙，随后第 2 轮连接、画面、声音与触控均正常（`tl_fails=0`）。
+  - **S3（Wi-Fi 入网中取消）：** 两版本均在 `WIFI_JOINED` 后出画前（约 `3.0–4.8 s`）收到 `USER_STOP` 干净取消，重连恢复正常（`tl_fails=0`）。
+  - **S4（仅视频 + 推流中动态开声音）：** `main` 于 ~69 s、`dev` 于 ~45.5 s 在推流中开启声音，均保持单次 `RECORD` 不拆链（`4556` / `3688` 帧）。实车观察到**偶发声音卡顿**：日志记录 UDP `AUDIO: 同步包` 偶有 `ECONNREFUSED` 重试，主 PCM 流报告 `补静音 0 帧，跳过 0 帧`。
+  - **S5（配对/建链中断开蓝牙）：** `dev` 在 `DISCOVERY`（`5.5 s`）与 `IAP2_IDENTIFIED`（`8.6 s`）阶段断蓝牙均立即以 `BT_LINK_CLOSED` 干净收尾，恢复蓝牙后重连正常（`2414` 帧）。
+  - **S6（回原车桌面再点 CarPlay 图标重进）：** `main`（2 轮）与 `dev`（连续 3 轮）均能响应 `requestUI` 重建主屏流、保持音频不断且恢复画面与触控。部分重进出现几秒黑屏后出画，日志确认为重建 `RECORD` 后等待 CarWith 下一个 IDR（如 `main` `20:46:44.596` 到 `20:46:49.875` 丢弃 65 个 P 帧、约 5.28 s；`dev` `21:02:19.389` 到 `21:02:21.574` 丢弃 22 帧、约 2.18 s），属编码器 GOP 间隔所致，非音频中断。
+- **WinPlay（`WinPlay / Roylyl / 1.2.5`，命中 `winplay.1.2.5.network-handoff`）：**
+  - `main` S1–S6 与 `dev` S1–S5 全部通过（网络交接后蓝牙释放、媒体推流保持正常）。
+  - **分辨率协商发现（`dev` #127）：** WinPlay 设为 `3000x2000` 时，`dev` 带 `DISABLE_RESOLUTION_OPTION=1` 请求 `3000x2000`，CarWith 回 `VIDEO_INIT_DONE 3000x2000@30`（日志记为“已采纳”），但 **CarWith 实际输出 SPS 为 `1920x720`** 导致画面比例异常；将 WinPlay 改设 `1920x1080` 后 `VIDEO_INIT_DONE` 与实际 SPS 均为 `1920x1080`，显示正常。
+  - **S6（桌面端）：** `main` 下点击 CarWith 内“返回车机”触发 `0x10021` 后 `modesChanged` 收到 `42B {}` 并按策略暂停视频（停在 550 帧），因桌面测试台无原生车机切换与 `requestUI` 回发（`requestUI=0`）导致画面定格，约 16 s 后 CarWith 自身停播。
+- **DiPlay（`vivo Pad Air`）：**
+  - `main` S1–S6 与 `dev` S1–S5 通过（网络交接与断蓝牙后保留已建网络流按预期工作）。
+  - `main` S6 复现已知 issue #51：触发 `0x10021` 让出主屏后视频暂停在 147 帧，平板未切换页面仍在回传触摸（`hidSendReport=78`）且 `requestUI=0`，画面定格。
+- **MacPlay（`1.2.4` / macOS `26.6.2`）：**
+  - `main` S1 冷启动带声音通过（首帧 ~8.3 s、首音频 ~13.0 s，`6700` 帧 / `6187` 音频包）。
+  - `main` S2 三次复测均失败（归档 3 份报告）：MacPlay 拒绝手机出站连接其 `channel=18`（`[cp-sock] bt bring-up failed`），导致手机在约 8 s 内触发 3 轮失败 180 s 断路器关闭监听，刚好错开 MacPlay 约 12 s 的 SDP 刷新与主动反连窗口；S3–S7 及 `dev` 对比跳过。
+- **范围边界：** 30 分钟持续推流（S7）与空端点晚到 `0x4301`（S8）本轮未执行；本记录仅代表上述已测手机与接收端组合在该构建下的实测结果，不扩大到其他车型或系统版本。
+
+## 2026-11-26：2023 款传祺 GS3 影速劲享版，偶发 0 帧白屏与 issue #127 分流
+
+- 车主报告 `36a2e771` 对应 `0.1.7-debug`（APK SHA-256
+  `3760c28334311d353651bf65c1b9dabaf040017f60bf00b936bc707f5c0c5248`），手机、HyperOS、
+  CarWith `4.0.23-20261016` 与 CarLife `8.8.5 (274)`。正常轮次可出画、触控和播放声音；
+  偶发轮次只出黑/白屏，声音仍在。
+- 两个明确失败轮次的导出快照分别为 `3016` / `2796` 个 CarWith 源视频帧、`0` 个车机视频写入，
+  `screenSuspended=true`；同一轮仍发送 `2398` / `2446` 个音频包。`20:21:55.099` 与
+  `20:24:31.477` 的 `/info modes` 都把主屏交给车机并记录约束 `500`，于是
+  `ModeArbiter.applyInitial()` 置 `phoneOwnsScreen=false`，`ScreenOutputGate` 按现有安全策略丢弃
+  全部视频帧。音频资源独立，因而形成“白屏但有声音”。
+- 同一报告 `2b31307c` 轮在 `20:23:47.867` 收到车机 `requestUI` 后，现有
+  `onUserRequestedUi()` 路径于 `20:23:49.208` 恢复出画并持续发送 `797` 帧。该轮 CarWith 返回
+  `1920x1080` 而不是请求的 `1920x720`，说明尺寸不一致本身没有阻止视频管道工作。
+- issue #127 是另一类问题：ROEWE 的 AirPlay 主屏为 `2560x1200`，CarWith 返回
+  `1920x1080@30`，会话持续 181 秒且有视频写入，但车机渲染异常。这里的失败证据是
+  `videoFramesSent=0` 加 `screenSuspended=true`，首先是主屏资源归属门控，不是 #127 的几何协商。
+  因此不把 #129 的 `DISABLE_RESOLUTION_OPTION=1` 变更并入本分支。GS3 上若以后出现
+  “帧持续增长但仍空白/拉伸”，再按 #127 类问题单独做尺寸 A/B。
+- 本分支新增受限策略 `claimScreenOnExplicitStart`，只在手动 GS3 预设启用，且只由用户明确点击连接产生。
+  意图带世代号并且只跨越仍活跃的同一连接轮次；不能仅凭时间线里历史的 `BT_LINK_CLOSED` 状态继承。
+  真实蓝牙断开会单独登记一次 30 秒内有效的自动重连延续，端点前可重试断开、ctrl 邀请重连和同一端点回放
+  会保留该意图，首个 `modesChanged` 获得 `200` 后才确认消费。车机持有主屏且约束不高于
+  `userInitiated(500)` 时，手机仅接管主屏；主音频保持原归属。`501` / `1000` 约束、已有手机主屏以及
+  CarWith 主动返回车机均不改变。
+- 验证边界：策略、模式仲裁和真实 RTSP 回环测试覆盖 `/info` 初始 `500/500`、`501/1000`、自动启动、
+  旧意图隔离与主音频不接管，并验证屏幕归属恢复后图像门会放行关键帧；测试未编码真实 IDR，
+  **且本修复尚未在 GS3 实车复测**，不能据此宣称偶发白屏已彻底解决。
+
+## 2026-11-26：2023 款传祺 GS3 影速劲享版，单次 RECORD 合并准备
+
+- 车主报告 `5c1f76dc` 的完整 7 次失败复现了首条 `RECORD` 成功后，在初始音频加入时补发第二条
+  `RECORD`，随后控制、事件和视频连接同时关闭。定位该顺序的实验包为
+  `dist/mcarplay-gs3-keep-network-final.apk`，SHA-256
+  `ddee16ad2dab6a1c40d2082ee4774343b0e8150a66e9a2df1721098fed728722`。
+- 该实验包先在其中单独隔离第二个 `RECORD`。随后 `origin/main` 的 `96c73a2`
+  已把初始会话流程统一改为：会话级 `SETUP` 后只发一次 `RECORD`，视频、音频和屏幕重建都复用这条
+  已激活的会话。GS3 分支因此删除临时的 `singleRecordPerSession`、
+  `skipRecordAfterInitialAudioSetup`、`record(force=true)` 和音频后补发路径，避免保留两套重复状态机。
+- 合并保留 GS3 的 `0x7F` 初始发送窗口、marker-first 建链，以及初始 `SETUP` 已写出后的蓝牙交接保护。
+  iAP2 通道同时采用最新主线的配对角色：首次连接由手机发起，已记录配对后等待车机发起并由手机响应。
+  SETUP 交接期间继续持有 handoff ownership 与 `sessionStarting`，车机回连 RFCOMM 不会提前
+  `retireSession` 掉仍在等待 `RECORD` 的 AirPlay TCP。
+- 旧实验包 `dist/mcarplay-gs3-single-record-20261126.apk` 不包含本次 rebase 后的通用单次 RECORD
+  时序，不能用它验证合并结果。
+- 验证边界：**本次合并尚未在 GS3 实车复测**。日志中的第二个 RECORD 是最直接的可复现伴因；音频
+  SETUP 后无效音量请求及实际 AAC 音频加入仍可能触发车机拆链，如复测仍闪断，下一轮应单独隔离这些变量。
+
+## 2026-11-25：2023 款传祺 GS3 影速劲享版，首个 RECORD 后闪断
+
+- 车主报告 `5c1f76dc` 对应实验 APK SHA-256 `ddee16ad2dab6a1c40d2082ee4774343b0e8150a66e9a2df1721098fed728722`
+  （`dist/mcarplay-gs3-keep-network-final.apk`）。手机 Xiaomi `2509FPN0BC`、Android 17 / SDK 37；
+  CarWith `4.0.23-20261016`、CarLife `8.8.5 (274)`。手动预设为
+  `manual.trumpchi-gs3.iap2-marker-first`。
+- 蓝牙兼容阶段已解除。报告中的保留尝试连续走通配对、Wi-Fi 加入、AirPlay `SETUP`、首条 `RECORD` 和
+  屏幕数据口，进入 `STREAMING` 并发送过 1 帧视频（12245B）。车机没有在 `RECORD` 前提前放弃。
+- 每次闪断都发生在初始音频 `SETUP` 成功后。初始连接路径随后补发第二个网络 `RECORD`，车机在该请求等待
+  应答期间关闭控制、事件和视频连接。22:46:08.244 音频加入后，22:46:08.634 事件通道 reset；
+  22:46:08.636 记录 `CSeq=18 RECORD` 失败。后续 6 次失败重复同一顺序，音频加入至拆链间隔约 70 到 400 ms。
+- 当轮实验只在 GS3 手动预设启用 `skipRecordAfterInitialAudioSetup` 与
+  `singleRecordPerSession`。后续主线已将单次 `RECORD` 推广到所有接收端，本分支只保留 GS3 的
+  iAP2 与 SETUP 交接部分。
+- 同时修正 SETUP 交接期间的所有权：蓝牙断开时只清 `activeReceiverObservations`，继续持有
+  `sessionStarting` 与 handoff ownership，防止车机回连端点 `retireSession` 掉等待 RECORD 的 AirPlay TCP。
+- 验证边界：策略回归、GS3 单次 RECORD 回环、延迟应答交接与 APK 构建通过。**本轮修复尚未在 GS3
+  实车复测**；第二次激活请求是这个闪断最直接的可复现伴因，仍需实车确认控制通道不再被主动关闭。
+
+## 2026-11-23：2023 款传祺 GS3 影速劲享版，iAP2 首发窗口 0x7F 复测
+
+- 车主导出的脱敏报告 `98b2e087` 对应 `0.1.7-debug` 实验 APK。手机 Xiaomi `2509FPN0BC`，
+  Android 17 / SDK 37，报告未列 HyperOS 版本。CarWith `4.0.23-20261016`，小米 CarLife `8.8.5 (274)`。
+  车机车型由车主提供，固件未知。车主选中 GS3 实验预设，配对后分别试过蓝牙自动启动和 App 内手动连接。
+- 抓包摘要中较早的配对轮次里，车机的 SDP 查询收到了手机 iAP2 和 CarPlay 记录。复测运行日志记录了
+  15 次主动 RFCOMM 链路使用 `maxOutgoing=127`，始终未解析到对端 iAP2 帧。部分连接在首次发送 SYN 后
+  几毫秒收到一段脱敏字节，随后约半秒关闭，其余多次重发直到协商超时。报告中没有链路就绪里程碑，
+  画面、声音与触控均未进入验证阶段。SDP 摘要和脱敏报告无法确定这段字节的类型。
+- 下一轮实验保留 0x7F，在手机主动连入车机 iAP2 服务时先发送探测 marker。确认收到对端 marker 后再发 SYN。
+  如果对端已经发来 SYN，则直接应答。报告中记录协商期初始读取长度和是否解析到 marker，用于区分
+  无应答、只应答探测和进入 iAP2 帧交换三种结果。
+
+## 2026-11-24：2023 款传祺 GS3 影速劲享版，蓝牙交接与 SETUP 先行窗口
+
+- 车主报告 `41b7e330` 对应实验 APK SHA-256 `31f7c088d593cc5e9461523c9c4413930b2e4c8556fac12aa844986ea725e146`
+  （`dist/mcarplay-gs3-probe-first.apk`）。手机 Xiaomi `2509FPN0BC`、Android 17 / SDK 37；
+  CarWith `4.0.23-20261016`、CarLife `8.8.5 (274)`。手动预设为
+  `manual.trumpchi-gs3.iap2-marker-first`。报告 `/info` 自报 `Trumpchi GM8`、`Yuanfeng Technology Co.,Ltd`、
+  AirPlay `450.14`，显示 `1920x720@60`。
+- 第一阶段已不再失败：报告连续多轮走通 `BT_LINK → IAP2_IDENTIFIED → IAP2_AUTHENTICATED →
+  WIFI_CREDENTIALS → WIFI_JOINED → CTRL_INVITED → RECEIVER_RESOLVED → AIRPLAY_CONNECTED →
+  PAIR_VERIFY → SESSION_SETUP`。车机没有可操作的热点界面不是阻塞条件，`0x5703` 下发了完整 Wi-Fi
+  凭据，手机随后成功加入车机提供的网络。
+- 失败点是车机在初始 AirPlay `SETUP` 后主动关闭蓝牙。23:00:39.235 日志记录 739B 的初始 `SETUP`
+  请求已准备（该行不证明写出完成）；23:00:39.270 车机关闭 RFCOMM；23:00:39.368 `/info` 返回
+  200；23:00:39.380 日志记录 `SETUP` 完成（eventPort、timingPort、显示参数均已解析），AirPlay TCP
+  当时仍正常；23:00:39.936 ACL 广播报告连接断开，23:00:39.940 AUTO 处理随后到达。旧策略在
+  39.272 就把整个会话判成 `BT_LINK_CLOSED` 并置 `connectCancelled=true`，于是 `SETUP` 完成后
+  直接在 RECORD 前退出。后续轮次在同一窗口重复失败。
+- 第三版仅给 GS3 手动预设增加“初始 `SETUP` 已成功写出”的交接窗口。判定发生在 `flush` 成功之后，
+  不等待 200；同时要求 AirPlay 控制 TCP 未关闭且未开始有序停止。RFCOMM 关闭与 ACL 广播共用该策略；
+  蓝牙链路断开时只移除该链路的存活标记，继续保留会话互斥，避免车机回连端点拆掉正在等待 RECORD 的会话。
+  非 200、写失败、连接更替或 `close()` 都会清除状态。AUTO、GENERIC 和其他接收端保持原行为。
+- 验证边界：新增策略测试和延迟应答 TCP 回环测试，完整 `spotlessCheck`、standard debug 单元测试、
+  lint 与 APK 构建通过。**尚未在 GS3 实车复测**，本条目不证明 RECORD、视频、声音或触控已经可用。
+
 ## 2026-11-14 issue #62：奔驰 MB_E-P-4「链路全通、视频 109 秒、车机无画面」（车主报告，未实车复测）
 
 - **来源：** `wangxso/mcarplay#62`，mcarplay `0.1.7` standard/release 的脱敏报告
@@ -2388,3 +2515,44 @@ HeadUnit-1 失败轮没有等到这一阶段：收到完整的 `0x5703` 后，�
 
 静态分析覆盖了手机侧已配对回连、凭据交付、断链回调和 AirPlay 恢复入口。MobileWiFi 内部的选网与取消条件、
 HeadUnit-1 提前结束 ACL 的原因，以及 iPhone 对这台车相同故障的实测表现，仍缺少证据。
+
+## 2026-11-26：HeadUnit-1 采用单通道 RFCOMM 仲裁后的首连
+
+Xiaomi 15（24129PN74C），HyperOS OS4.0.4.0.XOCCNXM，CarWith 4.0.23-20261016。同一设备配置此前记录的小米 CarLife 为
+8.8.5。接收端自报 HeadUnit-1，固件 1.0.0。保留现有配对，熄火后重新上车，由蓝牙事件自动发起会话。
+耗时从首次「上车自动启动」到应用发出首帧视频，包含中途重试。
+
+| 方案 | 上车到首帧 | 蓝牙过程 |
+| --- | --- | --- |
+| #106 的拨号期间拒绝入站 | 17.41 秒、64.71 秒 | 两轮的首次出站均失败。一轮随后由入站接手，另一轮经重拨成功。 |
+| 单通道仲裁与事件唤醒 | 9.27 秒、9.67 秒 | 上车后分别在 28 毫秒、27 毫秒发起出站拨号，两轮首拨成功。 |
+
+旧方案的 HCI 样本记录到出站发起认证、ACL 加密完成、入站 RFCOMM 建立、出站 `connect()` 返回的顺序。
+另一份双通道实验抓包中，入站先完成身份交换和出站先完成身份交换各有一轮。两轮在 App 发送另一条的 RFCOMM DISC 后，
+都未收到 `0x1d02` 的 iAP2 ACK，两轮各等待约 20 秒。第三轮在同一 ACL 的单条入站通道上正常收到证书并开始推流。
+
+新版实车覆盖首帧视频发送。测试 APK 与最后一次本地构建字节不同，日志确认了单通道仲裁。
+Android `connect()` 在 socket 关闭后仍未返回的超时路径由并发单测验证。音频、触控及该超时路径未单独做实车验证。
+
+## 2026 款江铃易至 EV3 Bicv MICA3A01：初始主屏归属为车机（2026-11-24，手机报告，未实车复测）
+
+- 来源：用户提供 `mcarplay-log-20261124-191911-8e828cb7-diagnostics.txt`（不入库）。手机 Xiaomi 25113PN0EC，
+  Android 17；CarWith `4.0.23-20261016 (104000023)`；小米 CarLife `8.8.5 (274)`；应用 `0.1.7 (1070000)`。
+- 接收端：`Bicv / GSE,EV3,SUV`，`firmwareRevision=MICA3A01`，`OSInfo=Android 13`，AirPlay `srcvers=475.8.3`。
+  用户确认为 2026 款江铃易至 EV3。
+- `/info modes` 固定为：主屏 `resourceID=1, transferType=1, transferPriority=500, takeConstraint=500,
+  borrowConstraint=100`，`initialPermanentEntity=permanentEntity=2`；主音频初始永久归属为手机。
+  因此 `ModeArbiter.applyInitial()` 记录“主屏=车机(约束 500)”符合该报文。
+- 多轮链路全通：0x4301 下发 AP、应用专属网络入网、pair-setup/verify、`/info`、SETUP、主屏流 SETUP
+  （`dataPort=6030`）、RECORD、CarWith 七路握手、`VIDEO_INIT_DONE` 与首帧。但 CarWith 帧到达后立即被
+  `ScreenOutputGate` 拦下，`sourceVideoFrames` 增长而 `videoFramesSent` 为 0。
+- 历史上一次成功会话推流到 247s 后收到 `changeModes(BORROW)` 才暂停；其后重连不再出画。最新几轮未见
+  车机主动 `requestUI`。`modesChanged` 均为 42B `NO_APP_STATES`，不能确认切换。
+- **对应修改（未实车验证）：** 仅对上述身份登记 `bicv.gse-ev3.475.8.3.auto-request-ui`。事件通道建立后、
+  初始 `modesChanged` 前，若主屏仍归车机，先发控制器侧 `requestUI`，再复用现有用户点 CarPlay 图标的
+  `ModeArbiter.onUserRequestedUi(takeAudio=false)` + `modesChanged` 路径声明主屏归手机。不发送
+  `changeModes`（Accessory→Controller 方向），也不改动 VW/ORA 等已验证行为。
+- **验证边界：** 本报告只证明链路协商成功和初始报文形状，不证明自动 `requestUI` 在车上生效。下一轮需要
+  看 `requestUI（手机→车机）ok=true`、`modesChanged` 是否回显归属、`sourceVideoFrames/videoFramesSent`
+  是否同步增长、触摸是否到达，以及音频 `6011` 是否仍 `ECONNREFUSED`。SETUP 隧道应答 `streams=null`
+  与音频 controlPort 拒绝暂不改代码。

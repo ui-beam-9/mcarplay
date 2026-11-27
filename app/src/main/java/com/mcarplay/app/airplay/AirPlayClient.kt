@@ -30,6 +30,7 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * AirPlay 客户端（Phase 2）：
@@ -67,7 +68,12 @@ class AirPlayClient(
     private val retryTick: ((attempt: Int) -> Unit)? = null,
     initialInfoRequest: InfoRequest = InfoRequest.GET_EMPTY_PLIST,
     private val detecting: Boolean = false,
+    /** 用户明确启动所形成的一次性主屏接管意图租约；首个 modesChanged 成功后才确认消费。 */
+    private val explicitStartScreenClaim: ExplicitStartScreenClaim.Lease? = null,
 ) {
+    internal val explicitStartScreenClaimLease: ExplicitStartScreenClaim.Lease?
+        get() = explicitStartScreenClaim
+
     var negotiatedInfoRequest: InfoRequest = initialInfoRequest
         private set
 
@@ -256,6 +262,20 @@ class AirPlayClient(
     /** RECORD 和网络 iAP 认证均完成，软件接收端才可在首帧前释放蓝牙。 */
     val networkHandoffReady: Boolean get() = recordAccepted && networkIapAuthenticated
 
+    /** 初始 SETUP 请求已经成功写出（不等待响应）：GS3 可在此刻开始网络交接。 */
+    private val initialSetupWritten = AtomicBoolean(false)
+
+    /**
+     * GS3 的 SETUP 交接窗口：控制 TCP 仍存活、尚未开始有序停止，且初始 SETUP 已成功写出。
+     * 响应可能在车机关闭蓝牙之后才到，因此不能依赖 `sessionSetupAccepted`。
+     */
+    val setupHandoffStarted: Boolean
+        get() =
+            initialSetupWritten.get() &&
+                !sessionStopping &&
+                !controlChannelClosed &&
+                socket?.isClosed == false
+
     /** 本连接已请求车机关蓝牙（[releaseReceiverBluetooth]），随后的蓝牙断开属预期。 */
     @Volatile
     var bluetoothReleaseRequested = false
@@ -263,6 +283,16 @@ class AirPlayClient(
 
     /** 会话已激活且控制通道仍在：只有这时 [stopLikeIphone] 的 TEARDOWN 才有对象。 */
     val sessionActive: Boolean get() = recordAccepted && socket?.isClosed == false
+
+    internal fun negotiatedReceiverIdentity(): ReceiverCompatibility.ReceiverIdentity? {
+        val info = negotiatedInfo ?: return null
+        return ReceiverCompatibility.classifyReceiverIdentity(
+            info["manufacturer"] as? String,
+            info["model"] as? String,
+            info["firmwareRevision"] as? String,
+            info["sourceVersion"] as? String ?: endpoint.sourceVersion,
+        )
+    }
 
     fun receiverCompatibility(): ReceiverCompatibility.Policy {
         val current = endpoint
@@ -650,6 +680,7 @@ class AirPlayClient(
     }
 
     fun close() {
+        initialSetupWritten.set(false)
         sessionSetupAccepted = false
         screenStreamUuid = null
         // 会话结束前记下 MIB3 订阅情况（issue #62）：突发后一条订阅都没有是「车机不认本会话」
@@ -688,12 +719,14 @@ class AirPlayClient(
             activeAddress = null
             // 新连接总是从明文开始；旧 cipher 不得带到新连接。
             cipher = null
-            synchronized(rtspWriteLock) {
-                readerSocket = null
-                readerThread = null
-                readerGeneration++
-            }
-            failAllPending("控制通道关闭")
+            val waiting =
+                synchronized(rtspWriteLock) {
+                    readerSocket = null
+                    readerThread = null
+                    readerGeneration++
+                    takePendingResponses()
+                }
+            failPendingResponses(waiting, "控制通道关闭")
             runCatching { iapTunnel?.socket?.close() }
             iapTunnel = null
             // 事件通道与计时服务也属于这一轮会话。
@@ -733,6 +766,25 @@ class AirPlayClient(
                 ),
             )
         log("AIRPLAY: hidSetInputMode(事件通道) uuid=$deviceUuidHex mode=$mode ok=$sent")
+        return sent
+    }
+
+    /**
+     * 手机侧发起 CarPlay UI 请求（`requestUI`）。R14G17 语义里这是“请车机把 CarPlay 界面带到前台”，
+     * 与用户点 CarPlay 图标后车机发出的 `requestUI` 是同一套资源接管路径的两个方向。
+     * 当前只用于 Bicv MICA3A01：它声明主屏初始永久归属为车机，但整轮屏幕 SETUP/RECORD 都已接受，
+     * 且不会主动送出 `requestUI`，需要控制器侧主动补这个请求。
+     */
+    fun requestCarplayUi(expectedEpoch: Long = connectionEpoch): Boolean {
+        val sent =
+            postEventCommand(
+                linkedMapOf(
+                    "type" to "requestUI",
+                    "params" to linkedMapOf<String, Any?>(),
+                ),
+                expectedEpoch = expectedEpoch,
+            )
+        log("AIRPLAY: requestUI（手机→车机）ok=$sent")
         return sent
     }
 
@@ -867,11 +919,17 @@ class AirPlayClient(
 
     /** 本会话的资源仲裁状态：/info modes 初始化，事件通道的 changeModes / requestUI 更新。 */
     internal val modes = ModeArbiter()
+    private val initialScreenClaimAwaitingAck = AtomicBoolean(false)
 
     fun assertModes(
         releaseScreen: Boolean = false,
         expectedEpoch: Long = connectionEpoch,
+        acknowledgeInitialScreenClaim: Boolean = false,
     ): Boolean {
+        val resources = modes.resourcesPayload(releaseScreen)
+        val announcesPhoneScreen =
+            resources.firstOrNull { it["resourceID"] == ModeArbiter.SCREEN }?.get("entity") ==
+                ModeArbiter.Entity.CONTROLLER.code
         val body =
             BinaryPlist.encode(
                 linkedMapOf(
@@ -884,7 +942,7 @@ class AirPlayClient(
                                     linkedMapOf<String, Any?>("appStateID" to 3L, "entity" to 0L),
                                     linkedMapOf<String, Any?>("appStateID" to 1L, "entity" to 0L, "speechMode" to -1L),
                                 ),
-                            "resources" to modes.resourcesPayload(releaseScreen),
+                            "resources" to resources,
                         ),
                 ),
             )
@@ -909,7 +967,15 @@ class AirPlayClient(
                 if (response.isEmpty()) "" else " 应答体 " + ModesAckClassifier.describe(response, responseShape)
             val state = if (releaseScreen) "让出主屏，随后拿回" else modes.describe()
             log("AIRPLAY: modesChanged（$state）[$statusLine]$responseText")
-            statusLine.contains("200")
+            val accepted = statusLine.contains("200")
+            if (accepted &&
+                announcesPhoneScreen &&
+                acknowledgeInitialScreenClaim &&
+                initialScreenClaimAwaitingAck.getAndSet(false)
+            ) {
+                explicitStartScreenClaim?.consume()
+            }
+            accepted
         } catch (error: IOException) {
             log("AIRPLAY: modesChanged 失败 - ${error.message}")
             false
@@ -1085,12 +1151,20 @@ class AirPlayClient(
                     "/setup",
                     body,
                     contentType = "application/x-apple-binary-plist",
+                    onWritten = {
+                        initialSetupWritten.set(true)
+                        if (policy.keepNetworkSessionDuringSetupHandoffOnBluetoothLoss) {
+                            log("GS3: AirPlay SETUP 已发出，进入网络交接窗口——继续等待 RECORD")
+                        }
+                    },
                 )
             } catch (error: IOException) {
+                initialSetupWritten.set(false)
                 log("AIRPLAY: SETUP 失败 - ${error.message}")
                 return null
             }
         if (!statusLine.contains("200")) {
+            initialSetupWritten.set(false)
             log("AIRPLAY: SETUP 应答 [$statusLine]（自报 deviceID=$deviceId）")
             if (statusLine.contains("403")) {
                 // 403 的两类成因按可能性排序：设备过滤（WinPlay 等「只接受指定
@@ -1182,6 +1256,23 @@ class AirPlayClient(
             // modes 决定车机如何仲裁主屏/主音频（requestUI 后能否切到 CarPlay），上一行被截断，单独完整记录
             root["modes"]?.let { log("AIRPLAY: /info modes=$it") }
             log("AIRPLAY: 资源仲裁初始 → ${modes.applyInitial(root["modes"] as? Map<*, *>)}")
+            val explicitStart = explicitStartScreenClaim?.isPending() == true
+            if (needsExplicitStartScreenClaim(explicitStart, compat, modes.phoneOwnsScreen)) {
+                val claim = modes.onUserRequestedUi(takeAudio = false)
+                initialScreenClaimAwaitingAck.set(claim.allowed)
+                if (claim.allowed) {
+                    log(
+                        "MODE: GS3 用户手动启动且主屏约束≤userInitiated——仅接管主屏（主音频保持原归属）",
+                    )
+                } else {
+                    log("MODE: GS3 用户手动启动但主屏约束高于 userInitiated——保持车机归属")
+                }
+            } else if (explicitStart && compat.claimScreenOnExplicitStart && modes.phoneOwnsScreen) {
+                // 主屏本就归手机；首个资源声明仍是对该手动启动意图的有效确认。
+                initialScreenClaimAwaitingAck.set(true)
+            } else if (explicitStartScreenClaim?.isPending() != true) {
+                initialScreenClaimAwaitingAck.set(false)
+            }
             // displays / displayPanels 已在 logInfoSummary 里逐条打印（含键值与几何对照），此处不再重复
             // 音频能力逐条打印（整行 /info 被 take(200) 截断，audioFormats 恰好断在中间）：
             // 决定 audioType 只能靠这里——奥迪 type=100 到底声明了 compatibility 还是 media
@@ -3025,6 +3116,7 @@ class AirPlayClient(
                                 socket = newSocket
                                 activeAddress = address
                                 activeHost = addressLiteral(address)
+                                initialSetupWritten.set(false)
                                 sessionStopping = false
                                 true
                             }
@@ -3151,6 +3243,7 @@ class AirPlayClient(
         extraHeaders: List<Pair<String, String>> = emptyList(),
         expectedEpoch: Long? = null,
         allowDuringStop: Boolean = false,
+        onWritten: (() -> Unit)? = null,
     ): Pair<String, ByteArray> {
         val client = socket ?: throw IOException("未连接")
         // 主线程上 socket 写会抛 NetworkOnMainThreadException，而那时报文已加密、计数已前移：
@@ -3200,6 +3293,7 @@ class AirPlayClient(
                 val output = client.getOutputStream()
                 output.write(wire)
                 output.flush()
+                onWritten?.invoke()
             } catch (error: Throwable) {
                 synchronized(pendingLock) { pendingResponses.remove(cseq) }
                 throw error
@@ -3286,12 +3380,19 @@ class AirPlayClient(
             }
         } catch (_: IOException) {
         } finally {
-            // 只由「当前」读线程清账：重连会换 socket 与新读线程，旧线程不得误伤新会话
-            if (generation == readerGeneration &&
-                failAllPending("控制通道读线程结束", expectedSocket = client) &&
-                !sessionStopping
-            ) {
-                onControlChannelClosed?.invoke()
+            // 与登记请求、切换读线程使用同一把锁：旧读线程不得清理新连接的待响应表，
+            // 同时校验当前 socket 后再通知控制通道断开回调。
+            val waiting =
+                synchronized(rtspWriteLock) {
+                    if (generation != readerGeneration || socket !== client) {
+                        null
+                    } else {
+                        takePendingResponses()
+                    }
+                }
+            if (waiting != null) {
+                failPendingResponses(waiting, "控制通道读线程结束")
+                if (!sessionStopping) onControlChannelClosed?.invoke()
             }
         }
     }
@@ -3363,25 +3464,28 @@ class AirPlayClient(
     /** 无匹配报文计数（节流日志用）。 */
     private var unmatchedMessages = 0
 
-    private fun failAllPending(
-        reason: String,
-        expectedSocket: Socket? = null,
-    ): Boolean {
-        // 2026-11-06 21:59 掉线时 airplay-rtsp-reader 在 CHM.values.toList() 上 FATAL
-        // （NoSuchElementException）。现在注册/移除/快照/清空全部由 pendingLock 串行化：
-        // 快照与清空是原子的，且 controlChannelClosed 与清空同时置位，晚到的 request()
-        // 会直接抛「控制通道已关闭」，不会登记后等满超时。
-        val waiting =
-            synchronized(pendingLock) {
-                if (expectedSocket != null && socket !== expectedSocket) return false
-                controlChannelClosed = true
-                pendingResponses.values.toList().also { pendingResponses.clear() }
-            }
-        if (waiting.isNotEmpty()) {
-            log("AIRPLAY: $reason——唤醒 ${waiting.size} 个待响应请求")
-            waiting.forEach { it.offer(RTSP_CLOSED_MARK to ByteArray(0)) }
+    /** 调用方持有 rtspWriteLock，防止清理期间新连接登记请求。 */
+    private fun takePendingResponses(): List<java.util.concurrent.LinkedBlockingQueue<Pair<String, ByteArray>>> {
+        val waiting = ArrayList<java.util.concurrent.LinkedBlockingQueue<Pair<String, ByteArray>>>()
+        // 调用方持有 rtspWriteLock，防止新连接在代际切换后登记请求；表项自身的增删由
+        // pendingLock 保护，这里同时置位关闭标志，晚到的 request() 会直接失败。
+        synchronized(pendingLock) {
+            controlChannelClosed = true
+            // 请求线程仍可能因超时/响应并发移除表项。不能用 values.toList()：Kotlin 在 size==1
+            // 时直接 next()，若表项恰好被移除会抛 NoSuchElementException，导致其余请求无法唤醒。
+            pendingResponses.forEach { _, queue -> waiting.add(queue) }
+            pendingResponses.clear()
         }
-        return true
+        return waiting
+    }
+
+    private fun failPendingResponses(
+        waiting: List<java.util.concurrent.LinkedBlockingQueue<Pair<String, ByteArray>>>,
+        reason: String,
+    ) {
+        if (waiting.isEmpty()) return
+        log("AIRPLAY: $reason——唤醒 ${waiting.size} 个待响应请求")
+        waiting.forEach { it.offer(RTSP_CLOSED_MARK to ByteArray(0)) }
     }
 
     private fun startReader(client: Socket) {
